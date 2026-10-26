@@ -1,0 +1,12 @@
+# 核心运行时
+playwright>=1.44.0
+PyYAML>=6.0
+requests>=2.31
+loguru>=0.7
+rich>=13.0
+lxml>=5.0
+
+# 可选：AI 兜底答题 / Web 控制台
+openai>=1.30
+fastapi>=0.110
+uvicorn>=0.29

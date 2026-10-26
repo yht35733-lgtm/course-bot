@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>fixture player</title></head>
+<body>
+<div id="quiz" class="ans-videoquiz-opt" style="display:none">弹题占位</div>
+<video id="v" width="320" height="180"></video>
+<script>
+  // 用可编程的假 video 模拟平台播放器：不依赖真实媒体文件
+  window.__t = 0;
+  window.__d = 20;
+  window.__paused = false;
+  var v = document.getElementById('v');
+  Object.defineProperty(v, 'duration', { get: function () { return window.__d; } });
+  Object.defineProperty(v, 'currentTime', {
+    get: function () { return window.__t; },
+    set: function (x) { window.__t = Math.max(0, Math.min(window.__d, x)); }
+  });
+  Object.defineProperty(v, 'paused', { get: function () { return window.__paused; } });
+  Object.defineProperty(v, 'ended', { get: function () { return window.__t >= window.__d; } });
+  v.play = function () {
+    window.__paused = false;
+    if (!window.__timer) {
+      window.__timer = setInterval(function () {
+        if (!window.__paused) { window.__t = Math.min(window.__d, window.__t + 0.5); }
+      }, 20);
+    }
+    return Promise.resolve();
+  };
+  v.pause = function () { window.__paused = true; };
+</script>
+</body>
+</html>

@@ -1,0 +1,59 @@
+# course-bot 配置模板
+# 用法：复制为 config.yaml 后按需修改，或直接 python main.py init
+# 所有路径项留空 = 解析到项目目录，整个文件夹换机器不会指错
+
+platform: chaoxing            # chaoxing（超星/学习通） | zhihuishu（智慧树）
+
+browser:
+  headless: false             # true = 无窗口后台跑
+  channel: ""                 # 可填 chrome / msedge；留空自动回落
+  slow_mo: 0                  # 每步操作的额外延迟（毫秒），调试用
+  profile_dir: ""             # 留空 = 项目下 .profiles（登录态存这里）
+  user_agent: ""              # 留空用浏览器默认
+  locale: zh-CN
+  timezone: Asia/Shanghai
+  viewport: {width: 1440, height: 900}
+  navigation_timeout: 45000
+
+video:
+  rate: 1.5                   # 目标倍速，不建议超过 2.0
+  force_rate: true            # 关键：覆写 playbackRate setter，防止被平台改回 1.0
+  mute: true
+  settle_ratio: 0.98          # 播到该比例即判定完成
+  tick: 3.0                   # 轮询间隔（秒），调小能更快发现卡住
+  stall_limit: 40             # 连续多少次无进度判定卡死
+  max_reload: 3               # 卡死后重载页面次数上限
+  skip_quiz: false            # true = 弹题直接关掉（部分平台会卡进度，慎用）
+  question_poll: 2.0
+
+quiz:
+  bank_path: ""               # 留空 = 项目下 data/bank.db
+  min_similarity: 0.82        # 题库模糊匹配阈值，题库不规范时调到 0.9
+  submit: true                # false = 只算不交，用于人工核对
+  retry_wrong: 1
+  delay_between: 1.2
+
+llm:                          # 题库未命中时的兜底（任意 OpenAI 兼容接口）
+  enabled: false
+  base_url: https://api.openai.com/v1
+  api_key: ""                 # 或用环境变量 COURSEBOT_LLM_KEY
+  model: gpt-4o-mini
+  temperature: 0
+  timeout: 60
+
+runner:
+  courses: []                 # 按名称关键词过滤，例 ["高等数学"]；留空 = 全部
+  course_ids: []              # 按课程 ID 过滤（Web 控制台用这个）
+  max_courses: 0              # 最多几门课，0 = 不限
+  max_tasks: 0                # 每门课最多几个小节，0 = 不限
+  order: video_then_quiz
+  cooldown: 0.6               # 任务之间冷却（秒）
+  course_interval: 3.0        # 课程之间冷却（秒）
+  loop_interval: 0            # >0 = 常驻，每 N 分钟跑一轮
+  daily_window: []            # 允许运行的时间段，例 ["00:30-06:30"]
+  reopen_course: true         # 每个小节前重开课程页（播放完章节索引会失效）
+  stop_on_error: false
+
+log:
+  level: INFO
+  file: ""                    # 留空 = 项目下 logs/coursebot.log

@@ -1,0 +1,52 @@
+# ---- 运行时产物 ----
+.profiles/
+.profiles-demo/
+logs/
+*.log
+
+# 本地配置（含学校/账号相关设置，不入库）
+config.yaml
+
+# 进度与待核对题目（个人数据）
+data/progress.json
+data/pending.jsonl
+data/*.tmp
+
+# 题库是本地产物；示例题库用 data/seed.jsonl 分发
+data/bank.db
+data/*.db-journal
+data/*.db-wal
+
+# 调试存档
+data/debug/
+*.html.bak
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 打包产物 ----
+*.zip
+*.7z

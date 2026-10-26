@@ -1,0 +1,4 @@
+{"question":"中华人民共和国成立于哪一年","qtype":"single","options":["1945年","1949年","1950年","1978年"],"answer":["1"]}
+{"question":"下列哪些属于面向对象的三大特性","qtype":"multiple","options":["封装","继承","多态","编译"],"answer":["0","1","2"]}
+{"question":"HTTP 协议是无状态协议","qtype":"judge","options":["正确","错误"],"answer":["0"]}
+{"question":"TCP 三次握手中第二个报文段的标志位是","qtype":"single","options":["SYN","SYN+ACK","ACK","FIN"],"answer":["1"]}

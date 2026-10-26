@@ -1,0 +1,191 @@
+"""答题引擎：题库匹配 -> LLM 兜底 -> 回写题库。
+
+平台适配器只负责"抽取"和"点选/提交"，判定与记忆都在这里。
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+from .bank import Bank
+from .llm import LLMQuizzer
+from .logger import log
+
+
+@dataclass
+class Question:
+    index: int
+    stem: str
+    qtype: str = "single"          # single | multiple | judge | fill | short
+    options: list[str] = field(default_factory=list)
+    answer: list[Any] = field(default_factory=list)
+    source: str = ""               # bank | llm | guess | manual
+    similarity: float = 0.0
+    root: Any = None               # 平台定位器（由适配器填充）
+    option_nodes: list[Any] = field(default_factory=list)
+
+
+@dataclass
+class QuizOutcome:
+    total: int = 0
+    answered: int = 0
+    from_bank: int = 0
+    from_llm: int = 0
+    guessed: int = 0
+    submitted: bool = False
+    detail: str = ""
+    pending: list[dict] = field(default_factory=list)
+
+
+class QuizEngine:
+    def __init__(self, bank: Bank, cfg: dict, llm_cfg: Optional[dict] = None,
+                 pending_path: Optional[Path] = None):
+        self.bank = bank
+        self.cfg = cfg or {}
+        self.llm = LLMQuizzer(llm_cfg or {})
+        self.threshold = float(self.cfg.get("min_similarity", 0.82))
+        self.pending_path = Path(pending_path) if pending_path else None
+
+    # ---------- 单题求解 ----------
+
+    def solve(self, q: Question) -> Question:
+        hit, score = self.bank.search(q.stem, q.qtype, self.threshold)
+        if hit:
+            q.answer = self._map_answer(hit["answer"], hit.get("options") or [], q)
+            q.source = "bank"
+            q.similarity = score
+            self.bank.bump(q.stem, q.qtype, True)
+            return q
+
+        if self.llm.available:
+            ans = self.llm.answer(q.stem, q.qtype, q.options)
+            if ans:
+                q.answer = self._map_answer(ans, [], q)
+                q.source = "llm"
+                q.similarity = 0.0
+                return q
+
+        q.answer = self._guess(q)
+        q.source = "guess"
+        self.bank.bump(q.stem, q.qtype, False)
+        return q
+
+    @staticmethod
+    def _norm_opt(text: str) -> str:
+        from .bank import normalize
+        return normalize(text)
+
+    def _map_answer(self, answer: list, stored_options: list, q: Question) -> list[Any]:
+        """题库里的答案可能是下标、字母或选项原文，统一映射到当前题的下标。"""
+        if q.qtype == "fill" or q.qtype == "short":
+            return [str(a) for a in answer]
+
+        current = [self._norm_opt(o) for o in q.options]
+        out: list[Any] = []
+        for a in answer:
+            if isinstance(a, int):
+                if 0 <= a < len(q.options):
+                    out.append(a)
+                continue
+            s = str(a).strip()
+            if s.isdigit():
+                i = int(s)
+                if 0 <= i < len(q.options):
+                    out.append(i)
+                continue
+            if len(s) == 1 and s.upper() in "ABCDEFGH" and len(q.options) <= 8:
+                i = "ABCDEFGH".index(s.upper())
+                if 0 <= i < len(q.options):
+                    out.append(i)
+                continue
+            # 选项原文匹配（优先当前题，其次题库快照）
+            na = self._norm_opt(s)
+            for i, o in enumerate(current):
+                if o == na or (o and na and (o in na or na in o)):
+                    out.append(i)
+                    break
+            else:
+                for i, o in enumerate(stored_options):
+                    o = o if isinstance(o, str) else (o.get("text") or o.get("label") or "")
+                    if self._norm_opt(o) == na:
+                        out.append(i)
+                        break
+        seen: list[Any] = []
+        for x in out:
+            if x not in seen:
+                seen.append(x)
+        return seen
+
+    def _guess(self, q: Question) -> list[Any]:
+        """无题库无模型时的保守猜测：判断题押"正确"，单选押 A。"""
+        if q.qtype == "judge":
+            return [0]
+        if q.qtype in ("single", "multiple") and q.options:
+            return [0]
+        return []
+
+    # ---------- 整页流程 ----------
+
+    async def run_page(self, adapter, page) -> QuizOutcome:
+        out = QuizOutcome()
+        questions = await adapter.extract_questions(page)
+        if not questions:
+            out.detail = "未识别到题目"
+            return out
+
+        out.total = len(questions)
+        log.info("本页识别到 " + str(len(questions)) + " 道题")
+
+        for q in questions:
+            self.solve(q)
+            tag = q.source
+            log.info(
+                "第" + str(q.index + 1) + "题 [" + q.qtype + "/" + tag + "] " +
+                q.stem[:40].replace("\n", " ") + " -> " + str(q.answer)
+            )
+            if q.answer:
+                out.answered += 1
+                if q.source == "bank":
+                    out.from_bank += 1
+                elif q.source == "llm":
+                    out.from_llm += 1
+                else:
+                    out.guessed += 1
+                    out.pending.append({
+                        "stem": q.stem, "qtype": q.qtype, "options": q.options,
+                        "guess": q.answer, "at": datetime.now().isoformat(timespec="seconds"),
+                    })
+            await adapter.answer_question(page, q)
+            await asyncio.sleep(float(self.cfg.get("delay_between", 1.2)))
+
+        if out.pending and self.pending_path:
+            self._dump_pending(out.pending)
+
+        if self.cfg.get("submit", True):
+            ok = await adapter.submit_quiz(page)
+            out.submitted = ok
+            if ok:
+                await adapter.read_quiz_result(page, questions)
+                for q in questions:
+                    if q.source == "llm" and q.answer:
+                        self.bank.add(q.stem, [str(x) for x in q.answer], q.qtype,
+                                      q.options, platform=adapter.name, source="llm")
+            out.detail = "已提交" if ok else "提交按钮未找到"
+        else:
+            out.detail = "仅计算，未提交"
+
+        return out
+
+    def _dump_pending(self, items: list[dict]) -> None:
+        """无把握的题落盘，前端能看到，补一道少一道。"""
+        try:
+            self.pending_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.pending_path, "a", encoding="utf-8") as f:
+                for it in items:
+                    f.write(json.dumps(it, ensure_ascii=False) + chr(10))
+        except Exception:
+            pass
