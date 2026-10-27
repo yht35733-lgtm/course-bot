@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -257,14 +258,38 @@ def main() -> None:
     elif args.cmd == "run":
         asyncio.run(cmd_run(cfg, args))
     elif args.cmd == "serve":
+        import socket
         import uvicorn
         from coursebot.state import LogBuffer
         from coursebot.webui import create_app
 
+        # 单实例保护：端口被占用说明已经有一个在跑，别再起第二个把机器拖死
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.settimeout(1)
+        in_use = probe.connect_ex((args.host, args.port)) == 0
+        probe.close()
+        if in_use:
+            print("端口 " + str(args.port) + " 已被占用，控制台可能已经在跑了：")
+            print("  http://" + args.host + ":" + str(args.port))
+            print("要重启用 stop.bat，或换个端口 --port 8001")
+            return
+
+        pid_file = ROOT / "data" / "serve.pid"
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
         buffer = LogBuffer()
         log.add(buffer.sink, level="DEBUG")
         print("控制台: http://" + args.host + ":" + str(args.port))
-        uvicorn.run(create_app(cfg, buffer), host=args.host, port=args.port, log_level="warning")
+        print("PID " + str(os.getpid()) + "，停止请用 stop.bat 或 Ctrl+C")
+        try:
+            uvicorn.run(create_app(cfg, buffer), host=args.host, port=args.port,
+                        log_level="warning")
+        finally:
+            try:
+                pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
