@@ -65,6 +65,12 @@ class BrowserSession:
         from playwright.async_api import async_playwright
 
         self.profile_dir.mkdir(parents=True, exist_ok=True)
+        if self.headless:
+            # 实测：同一个视频，headless 上报接口返回 isPassed=false，
+            # 有头模式返回 isPassed=true —— 超星会识别无头浏览器并判定无效
+            from .logger import log as _log
+            _log.warning("无头模式下平台可能判定学习记录无效（isPassed=false），"
+                         "想正常记账请关掉「无窗口运行」")
         self._pw = await async_playwright().start()
 
         args = [
@@ -72,7 +78,15 @@ class BrowserSession:
             "--mute-audio",
             "--no-first-run",
             "--no-default-browser-check",
+            # 窗口被遮挡或切到后台时，Chromium 会节流定时器和渲染，
+            # 播放器跟着停摆、弹题也不弹——这三个开关关掉节流
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
         ]
+        # 把窗口挪到屏幕外，免得跑的时候一直抢前台焦点；代价是拿不到焦点态
+        if self.cfg.get("offscreen"):
+            args += ["--window-position=-32000,-32000"]
         kwargs: dict[str, Any] = {
             "user_data_dir": str(self.profile_dir),
             "headless": self.headless,
@@ -93,6 +107,23 @@ class BrowserSession:
         await self.restore_state()
         return self
 
+    LOCK_NAMES = ("SingletonLock", "SingletonCookie", "SingletonSocket",
+                  "lockfile", "DevToolsActivePort")
+
+    def _clear_locks(self) -> int:
+        """上一个浏览器被强杀时会留下 profile 锁，不清掉新实例就起不来（Edge 直接退出码 21）。"""
+        removed = 0
+        if not self.profile_dir.exists():
+            return 0
+        for name in self.LOCK_NAMES:
+            for p in list(self.profile_dir.rglob(name)):
+                try:
+                    p.unlink()
+                    removed += 1
+                except Exception:
+                    continue
+        return removed
+
     async def _launch(self, kwargs: dict):
         """优先用内置 chromium；没装时回落到本机 Chrome / Edge。"""
         attempts = [dict(kwargs)]
@@ -101,12 +132,21 @@ class BrowserSession:
                 k = dict(kwargs)
                 k["channel"] = ch
                 attempts.append(k)
+
         last: Exception | None = None
         for k in attempts:
             try:
                 return await self._pw.chromium.launch_persistent_context(**k)
-            except Exception as e:  # 浏览器缺失 / 被占用
+            except Exception as e:  # 浏览器缺失 / profile 被占用
                 last = e
+                hint = str(e).lower()
+                stuck = ("has been closed" in hint or "singletonlock" in hint
+                         or "exitcode=21" in hint or "profile" in hint and "lock" in hint)
+                if stuck and self._clear_locks():
+                    try:
+                        return await self._pw.chromium.launch_persistent_context(**k)
+                    except Exception as e2:
+                        last = e2
         raise last if last else RuntimeError("无法启动浏览器")
 
     async def __aexit__(self, *exc) -> None:

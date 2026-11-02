@@ -17,9 +17,19 @@ data/bank.db
 data/*.db-journal
 data/*.db-wal
 
-# 调试存档
+# 字体反爬的临时产物（运行时重新生成）
+data/fonts/
+data/glyph_cache*.npz
+
+# 调试存档 / 诊断输出
 data/debug/
+data/*.txt
+data/*.png
+data/serve.pid
 *.html.bak
+
+# 一次性调试脚本
+scripts/_*.py
 
 # ---- Python ----
 __pycache__/

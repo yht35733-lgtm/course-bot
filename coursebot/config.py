@@ -22,12 +22,14 @@ DEFAULTS: dict[str, Any] = {
         "timezone": "Asia/Shanghai",
         "viewport": {"width": 1440, "height": 900},
         "navigation_timeout": 45000,
+        "login_wait": 900,       # 扫码登录最长等待秒数
+        "offscreen": False,      # True = 把窗口挪到屏幕外，跑的时候不抢前台
     },
     "video": {
-        "rate": 1.5,              # 目标倍速
+        "rate": 1.0,              # 目标倍速；超星按真实时长判定，别调高
         "force_rate": True,       # 注入 playbackRate 守护，对抗平台重置
         "mute": True,
-        "settle_ratio": 0.98,     # 单集进度达到该比例即视为完成
+        "settle_ratio": 0.999,    # 单集进度达到该比例即视为完成
         "tick": 3.0,              # 轮询间隔（秒）
         "stall_limit": 40,        # 连续多少 tick 无进度则重载
         "max_reload": 3,
@@ -40,14 +42,21 @@ DEFAULTS: dict[str, Any] = {
         "submit": True,           # False = 只打印答案不提交，用于人工核对
         "retry_wrong": 1,
         "delay_between": 1.2,
+        "submit_delay": 60,       # 提交前等待秒数；太短会触发 /work/validate 的账号异常判定
     },
     "llm": {
         "enabled": False,
-        "base_url": "https://api.openai.com/v1",
+        # 任何 OpenAI 兼容端点都行：DeepSeek / 通义 / 智谱 / Kimi / OpenAI
+        # 想要「先联网检索再答」就把这里换成 Perplexity sonar
+        "base_url": "https://api.deepseek.com/v1",
         "api_key": "",
-        "model": "gpt-4o-mini",
+        "model": "deepseek-chat",
         "temperature": 0,
-        "timeout": 60,
+        "timeout": 90,
+        "retries": 2,
+        "max_tokens": 2000,
+        # 模型自评把握低于这个值就不采用，改走保守猜测并记入 pending
+        "min_confidence": 0.0,
     },
     "runner": {
         "courses": [],            # 留空 = 全部课程

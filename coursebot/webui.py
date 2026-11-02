@@ -9,6 +9,7 @@ import copy
 import json
 from pathlib import Path
 
+import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -37,10 +38,13 @@ def create_app(cfg: dict, log_sink: LogBuffer | None = None) -> FastAPI:
         "task": None,
         "courses": [],
         "busy": False,
-        "login": ({"running": False, "ok": True, "msg": "已登录"}
+        "login": ({"running": False, "ok": None, "msg": "登录态待验证"}
                   if logged_before else {"running": False, "ok": False, "msg": "未登录"}),
         "note": "",
     }
+
+    # 同一个 profile 目录同一时刻只能有一个浏览器，否则 Edge/Chrome 直接退出（exitCode 21）
+    browser_lock = asyncio.Lock()
 
     # ---------------- 页面 ----------------
 
@@ -62,20 +66,29 @@ def create_app(cfg: dict, log_sink: LogBuffer | None = None) -> FastAPI:
         session["login"] = {"running": True, "ok": False, "msg": "等待扫码…"}
 
         async def job():
+            ok = False
             try:
-                async with BrowserSession(cfg["browser"], headless=headless) as sess:
-                    page = await sess.new_page()
-                    adapter = get_adapter(cfg["platform"])(page, cfg)
-                    ok = await adapter.login(wait_seconds=600)
-                    if ok:
-                        await sess.save_state()
-                        session["login"] = {"running": False, "ok": True, "msg": "登录成功"}
-                        await _fetch_courses()
-                    else:
-                        session["login"] = {"running": False, "ok": False, "msg": "登录超时"}
+                async with browser_lock:
+                    async with BrowserSession(cfg["browser"], headless=headless) as sess:
+                        page = await sess.new_page()
+                        adapter = get_adapter(cfg["platform"])(page, cfg)
+                        ok = await adapter.login(wait_seconds=int(
+                            cfg["browser"].get("login_wait") or 900))
+                        if ok:
+                            await sess.save_state()
             except Exception as e:
                 log.exception("登录失败: " + str(e))
-                session["login"] = {"running": False, "ok": False, "msg": "登录异常: " + str(e)}
+                session["login"] = {"running": False, "ok": False,
+                                    "msg": "登录异常: " + str(e)}
+                return
+
+            if not ok:
+                session["login"] = {"running": False, "ok": False, "msg": "登录超时"}
+                return
+
+            session["login"] = {"running": False, "ok": True, "msg": "登录成功"}
+            # 浏览器已经关掉了，现在再拉课程才不会撞 profile 锁
+            await _fetch_courses()
 
         asyncio.create_task(job())
         return JSONResponse({"ok": True, "msg": "已打开登录窗口，请扫码"})
@@ -91,17 +104,26 @@ def create_app(cfg: dict, log_sink: LogBuffer | None = None) -> FastAPI:
             return session["courses"], "任务运行中"
         session["busy"] = True
         try:
-            async with BrowserSession(cfg["browser"], headless=True) as sess:
-                page = await sess.new_page()
-                adapter = get_adapter(cfg["platform"])(page, cfg)
-                await adapter.goto_home()
-                if not await adapter.is_logged_in():
-                    return [], "未登录，请先点「登录」"
-                courses = await adapter.list_courses()
-                session["courses"] = [
-                    {"cid": c.cid, "name": c.name, "url": c.url} for c in courses
-                ]
-                return session["courses"], ""
+            async with browser_lock:
+                async with BrowserSession(cfg["browser"], headless=True) as sess:
+                    page = await sess.new_page()
+                    adapter = get_adapter(cfg["platform"])(page, cfg)
+                    await adapter.goto_home()
+                    if not await adapter.is_logged_in():
+                        session["login"] = {"running": False, "ok": False,
+                                            "msg": "未登录，请点「登录」"}
+                        return [], "未登录，请先点「登录」"
+                    if not await adapter.verify_login():
+                        # 票据还在但服务端不认——上一轮登录没存完整
+                        session["login"] = {"running": False, "ok": False,
+                                            "msg": "登录态已失效，请重新登录"}
+                        return [], "登录态已失效，请重新登录"
+                    courses = await adapter.list_courses()
+                    session["courses"] = [
+                        {"cid": c.cid, "name": c.name, "url": c.url} for c in courses
+                    ]
+                    session["login"] = {"running": False, "ok": True, "msg": "已登录"}
+                    return session["courses"], ""
         except Exception as e:
             log.exception("拉取课程失败: " + str(e))
             return session["courses"], str(e)
@@ -130,7 +152,7 @@ def create_app(cfg: dict, log_sink: LogBuffer | None = None) -> FastAPI:
         if session["busy"]:
             return JSONResponse({"ok": False, "msg": "浏览器被占用，稍后再试"})
 
-        ids = body.get("course_ids") or []
+        ids = [str(x) for x in (body.get("course_ids") or []) if str(x).strip()]
         if not ids:
             return JSONResponse({"ok": False, "msg": "至少选一门课"})
 
@@ -148,6 +170,7 @@ def create_app(cfg: dict, log_sink: LogBuffer | None = None) -> FastAPI:
         mode = body.get("mode") or "all"
         only_kind = None if mode == "all" else mode
 
+        run_state.control.reset()  # 清掉上一轮的停止标志，否则新任务起不来
         runner = Runner(run_cfg, only_kind=only_kind, state=run_state)
         session["runner"] = runner
         log.info("控制台启动: 课程 " + str(len(ids)) + " 门, 模式 " + mode)
@@ -237,6 +260,79 @@ def create_app(cfg: dict, log_sink: LogBuffer | None = None) -> FastAPI:
             return st
         finally:
             b.close()
+
+    # ---------------- 模型设置 ----------------
+
+    LLM_KEYS = ("enabled", "base_url", "model", "temperature", "timeout",
+                "retries", "max_tokens", "min_confidence")
+
+    def _persist_llm(llm: dict) -> None:
+        """只改 config.yaml 里的 llm 段，其它内容原样保留。"""
+        path = Path(cfg.get("_source") or (ROOT / "config.yaml"))
+        data: dict = {}
+        if path.exists():
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                data = {}
+        block = {k: llm.get(k) for k in LLM_KEYS if k in llm}
+        # api_key 不在 LLM_KEYS 里，之前漏写了，导致重启后模型失效
+        if llm.get("api_key"):
+            block["api_key"] = llm["api_key"]
+        data["llm"] = block
+        path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+                        encoding="utf-8")
+
+    @app.get("/api/llm")
+    async def api_llm_get():
+        llm = dict(cfg.get("llm") or {})
+        key = str(llm.pop("api_key", "") or "")
+        llm["has_key"] = bool(key)
+        llm["key_hint"] = (key[:4] + "****" + key[-4:]) if len(key) > 10 else ""
+        return JSONResponse(llm)
+
+    @app.post("/api/llm")
+    async def api_llm_set(request: Request):
+        body = await _json(request)
+        llm = cfg.setdefault("llm", {})
+        for k in LLM_KEYS:
+            if k in body and body[k] is not None:
+                llm[k] = body[k]
+        key = (body.get("api_key") or "").strip()
+        if key:
+            llm["api_key"] = key
+        elif body.get("clear_key"):
+            llm["api_key"] = ""
+        try:
+            _persist_llm(llm)
+        except Exception as e:
+            return JSONResponse({"ok": False, "msg": "写入 config.yaml 失败: " + str(e)})
+
+        from .llm import LLMQuizzer
+        probe = LLMQuizzer(llm)
+        msg = "已保存"
+        if llm.get("enabled") and not probe.available:
+            msg = "已保存，但客户端没起来，检查 api_key 与 openai 包"
+        return JSONResponse({"ok": True, "msg": msg, "ready": probe.available})
+
+    @app.post("/api/llm/test")
+    async def api_llm_test():
+        from .llm import LLMQuizzer
+        sample = [{
+            "i": 0, "qtype": "single",
+            "stem": "TCP 三次握手中第二个报文段的标志位是",
+            "options": ["SYN", "SYN+ACK", "ACK", "FIN"],
+        }]
+        quizzer = LLMQuizzer(dict(cfg.get("llm") or {}))
+        if not quizzer.available:
+            return JSONResponse({"ok": False, "msg": "模型未启用或缺少 api_key"})
+        got = await asyncio.to_thread(quizzer.answer_batch, sample)
+        hit = got.get(0)
+        if not hit:
+            return JSONResponse({"ok": False, "msg": "调用失败，查看日志里的具体报错"})
+        ans, conf = hit
+        return JSONResponse({"ok": True,
+                             "msg": "答题正常：" + str(ans) + " 置信度 " + str(round(conf, 2))})
 
     @app.get("/api/bank")
     async def api_bank():

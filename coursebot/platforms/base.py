@@ -28,6 +28,7 @@ class PlatformAdapter(ABC):
     QUESTION_STEM: str = ""
     QUESTION_OPTION: str = ""
     SUBMIT_BTN: str = ""
+    QUIZ_CLOSE: str = ""
     IFRAME_TIMEOUT: int = 8000
 
     def __init__(self, page, cfg: Optional[dict] = None):
@@ -46,19 +47,41 @@ class PlatformAdapter(ABC):
     async def is_logged_in(self) -> bool:
         ...
 
-    async def login(self, wait_seconds: int = 180) -> bool:
-        """打开登录页，等人工扫码/账密登录完成。"""
+    VERIFY_URL: str = ""
+
+    async def verify_login(self) -> bool:
+        """只用 cookie 判断会被残留票据骗到，所以真去请求一次需要登录的页面。
+
+        默认实现返回 True，子类有 COURSE_URL 时覆盖。
+        """
+        return True
+
+    async def login(self, wait_seconds: int = 900) -> bool:
+        """打开登录页，等人工扫码/账密登录完成。
+
+        判定分两步：先看 cookie 里有没有票据，再真的请求一次目标页确认服务端认可。
+        只看 cookie 会误判——上一轮的残留票据还在，一开窗就"秒成功"，窗口立刻被关掉。
+        """
+        wait_seconds = int(self.cfg.get("login_wait") or wait_seconds)
         try:
             await self.page.goto(self.login_url or self.home_url, wait_until="domcontentloaded")
         except Exception:
             pass
-        log.warning("请在浏览器窗口中完成登录（扫码或账密），最长等待 " + str(wait_seconds) + " 秒")
-        for _ in range(int(wait_seconds / 3)):
+        log.warning("请在浏览器窗口中完成登录（扫码或账密），最长等待 "
+                    + str(wait_seconds) + " 秒，完成后窗口会自动关闭")
+        rounds = max(1, int(wait_seconds / 3))
+        for i in range(rounds):
             await asyncio.sleep(3)
-            if await self.is_logged_in():
-                log.info("登录成功，登录态已写入 profile")
+            if not await self.is_logged_in():
+                if i and i % 20 == 0:
+                    log.info("仍在等待登录…（已等 " + str(i * 3) + " 秒）")
+                continue
+            if await self.verify_login():
+                log.info("登录成功，服务端已确认")
                 return True
-        log.error("登录等待超时")
+            if i % 5 == 0:
+                log.info("检测到登录票据但服务端还没认，继续等待…")
+        log.error("登录等待超时（" + str(wait_seconds) + " 秒）")
         return False
 
     # ---------------- 课程与任务 ----------------
@@ -96,10 +119,53 @@ class PlatformAdapter(ABC):
     async def read_quiz_result(self, page, questions: list[Question]) -> None:
         return None
 
+    async def dismiss_quiz(self, page) -> bool:
+        """弹题答不上时把它关掉，否则视频会永远停在这里，整个章节做不完。
+
+        先试关闭按钮，最后用 JS 直接把容器从 DOM 里摘掉——这一步保证下一次
+        轮询检测不到弹题，避免"检测到→答不上→再检测到"的死循环。
+        """
+        closed = False
+        for sel in (self.QUIZ_CLOSE or "").split(","):
+            sel = sel.strip()
+            if not sel:
+                continue
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(timeout=2500)
+                    closed = True
+                    break
+            except Exception:
+                continue
+
+        removed = 0
+        if self.VIDEO_QUESTION_POPUP:
+            try:
+                removed = await page.evaluate(
+                    "(sel) => { const ns = document.querySelectorAll(sel);"
+                    " let c = 0; ns.forEach((n) => { n.remove(); c++; }); return c; }",
+                    self.VIDEO_QUESTION_POPUP,
+                )
+            except Exception:
+                removed = 0
+        return closed or bool(removed)
+
     # ---------------- 工具 ----------------
 
     async def content_frame(self, page):
         """取视频所在的 iframe frame；找不到就退回主页。"""
+        # 先按 URL 特征找（iframe 的 id 经常变，URL 里的模块名反而稳定）
+        try:
+            # 任务点图标全在 knowledge/cards 里，先找它；ananas 只是播放器内层
+            for f in page.frames:
+                if "knowledge/cards" in (f.url or ""):
+                    return f
+            for f in page.frames:
+                if "ananas/modules" in (f.url or ""):
+                    return f
+        except Exception:
+            pass
         if not self.CONTENT_IFRAME:
             return page
         try:
@@ -125,6 +191,13 @@ class PlatformAdapter(ABC):
         try:
             await locator.click(timeout=4000)
             return True
+        except Exception:
+            # 无头模式下元素常被判"不可操作"，用 JS 直接触发一次
+            try:
+                await locator.evaluate("(el) => el.click()")
+                return True
+            except Exception:
+                pass
         except Exception:
             try:
                 await locator.click(force=True, timeout=3000)

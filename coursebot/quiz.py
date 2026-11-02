@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -128,11 +129,39 @@ class QuizEngine:
             return [0]
         return []
 
+    def solve_local(self, q: Question) -> Question:
+        """只查本地题库；没命中就标记 none，留给批量模型。"""
+        hit, score = self.bank.search(q.stem, q.qtype, self.threshold)
+        q.similarity = score
+        if hit:
+            q.answer = self._map_answer(hit["answer"], hit.get("options") or [], q)
+            q.source = "bank"
+            self.bank.bump(q.stem, q.qtype, True)
+        else:
+            q.answer = []
+            q.source = "none"
+        return q
+
     # ---------- 整页流程 ----------
 
-    async def run_page(self, adapter, page) -> QuizOutcome:
+    async def run_page(self, adapter, page, frames=None) -> QuizOutcome:
         out = QuizOutcome()
-        questions = await adapter.extract_questions(page)
+        questions: list[Question] = []
+        target = page
+        # 弹题可能不在播放器所在的 frame 里，逐个 frame 试一遍
+        candidates = [page]
+        for f in (frames or []):
+            if f is not page:
+                candidates.append(f)
+        for cand in candidates:
+            try:
+                found = await adapter.extract_questions(cand)
+            except Exception:
+                found = []
+            if found:
+                questions = found
+                target = cand
+                break
         if not questions:
             out.detail = "未识别到题目"
             return out
@@ -140,8 +169,38 @@ class QuizEngine:
         out.total = len(questions)
         log.info("本页识别到 " + str(len(questions)) + " 道题")
 
+        # 第一轮：本地题库（快、确定性高）
+        need_llm: list[Question] = []
         for q in questions:
-            self.solve(q)
+            self.solve_local(q)
+            if q.source == "none":
+                need_llm.append(q)
+
+        # 第二轮：把这一页没命中的题一次性丢给模型，避免一题一次往返
+        if need_llm:
+            got: dict[int, tuple] = {}
+            if self.llm.available:
+                items = [{"i": i, "stem": q.stem, "qtype": q.qtype, "options": q.options}
+                         for i, q in enumerate(need_llm)]
+                log.info("交给模型作答 " + str(len(items)) + " 题")
+                try:
+                    got = await asyncio.to_thread(self.llm.answer_batch, items)
+                except Exception as e:
+                    log.warning("模型批量作答异常: " + str(e))
+                    got = {}
+
+            for i, q in enumerate(need_llm):
+                hit = got.get(i)
+                if hit:
+                    ans, conf = hit
+                    q.answer = self._map_answer(ans, [], q)
+                    q.source = "llm"
+                    q.similarity = conf
+                else:
+                    q.answer = self._guess(q)
+                    q.source = "guess"
+
+        for q in questions:
             tag = q.source
             log.info(
                 "第" + str(q.index + 1) + "题 [" + q.qtype + "/" + tag + "] " +
@@ -159,17 +218,24 @@ class QuizEngine:
                         "stem": q.stem, "qtype": q.qtype, "options": q.options,
                         "guess": q.answer, "at": datetime.now().isoformat(timespec="seconds"),
                     })
-            await adapter.answer_question(page, q)
+            await adapter.answer_question(target, q)
             await asyncio.sleep(float(self.cfg.get("delay_between", 1.2)))
 
         if out.pending and self.pending_path:
             self._dump_pending(out.pending)
 
         if self.cfg.get("submit", True):
-            ok = await adapter.submit_quiz(page)
+            # 提交前会先打 /work/validate，返回 status=1 就判「账号异常」直接拦下。
+            # 答题太快最容易触发，等久一点并带随机抖动。
+            wait = float(self.cfg.get("submit_delay", 60))
+            if wait > 0:
+                wait += random.uniform(0, wait * 0.3)
+                log.info("提交前等待 " + str(int(wait)) + " 秒，避开风控校验")
+                await asyncio.sleep(wait)
+            ok = await adapter.submit_quiz(target)
             out.submitted = ok
             if ok:
-                await adapter.read_quiz_result(page, questions)
+                await adapter.read_quiz_result(target, questions)
                 for q in questions:
                     if q.source == "llm" and q.answer:
                         self.bank.add(q.stem, [str(x) for x in q.answer], q.qtype,

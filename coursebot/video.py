@@ -39,9 +39,13 @@ JS_DRIVE = """
   const vs = Array.from(document.querySelectorAll('video'));
   if (!vs.length) return false;
   const v = vs.sort(function (a, b) { return (b.duration || 0) - (a.duration || 0); })[0];
-  if (opt.mute) { try { v.muted = true; v.volume = 0; } catch (e) {} }
-  try { v.playbackRate = opt.rate; } catch (e) {}
-  if (v.paused) { v.play().catch(function () {}); }
+  // 只在值真的需要改时才写：每轮都设一次会不停触发 ratechange / volumechange，
+  // 平台的播放器把这些事件当成异常播放，学习时长就记不上，任务点永远不变绿
+  if (opt.mute && !v.muted) { try { v.muted = true; v.volume = 0; } catch (e) {} }
+  if (Math.abs((v.playbackRate || 1) - opt.rate) > 0.01) {
+    try { v.playbackRate = opt.rate; } catch (e) {}
+  }
+  if (v.paused && !v.ended) { v.play().catch(function () {}); }
   return true;
 }
 """
@@ -59,6 +63,57 @@ JS_NUDGE = """
 """
 
 JS_PAUSE = "() => { document.querySelectorAll('video').forEach(function (v) { v.pause(); }); }"
+
+# 视频卡片的 data 属性里写着这门课的限制：doublespeed=1 就是不许倍速，
+# 硬加速会被判违规，学习时长直接作废
+JS_LIMIT = """
+() => {
+  const el = document.querySelector('.ans-attach-online');
+  if (!el) return { rate: 0, drag: true, switchwin: true };
+  let d = {};
+  try { d = JSON.parse(el.getAttribute('data') || '{}'); } catch (e) { d = {}; }
+  return {
+    rate: Number(d.doublespeed || 0),
+    drag: d.fastforward !== 'false',
+    switchwin: d.switchwindow !== 'false'
+  };
+}
+"""
+
+# 用播放器自己的按钮起播：超星的上报逻辑（multimedia/log）绑在它自己的播放流程上，
+# 直接拿 video 元素调 play() 只会让画面动，学习时长一条都不会发出去
+JS_CLICK_PLAY = """
+() => {
+  // 一、优先走 Video.js 的 player API：播放状态、timeupdate、上报插件才会联动。
+  // 直接对 <video> 调 play() 只有画面动，player 还以为自己是 vjs-paused。
+  try {
+    if (window.videojs) {
+      let p = null;
+      try { p = window.videojs.getPlayer('video'); } catch (e) {}
+      if (!p) {
+        const el = document.querySelector('.video-js');
+        if (el && window.videojs) { p = window.videojs(el); }
+      }
+      if (p && typeof p.play === 'function') { p.play(); return 'videojs-api'; }
+    }
+  } catch (e) {}
+
+  // 二、退而求其次：点播放按钮
+  const sels = ['.vjs-big-play-button', '.vjs-play-control', '.prism-big-play-btn',
+                '.dvp-play-btn', '.play-btn', '.videojs-big-play-button'];
+  for (const s of sels) {
+    const el = document.querySelector(s);
+    if (el) {
+      try { el.click(); return 'click:' + s; } catch (e) {}
+    }
+  }
+
+  // 三、最后才用原生 play()
+  const v = document.querySelector('video');
+  if (v) { try { v.play(); return 'native'; } catch (e) {} }
+  return '';
+}
+"""
 
 
 class VideoEngine:
@@ -114,11 +169,34 @@ class VideoEngine:
         reloads = 0
         stalls = 0
         last_t = -1.0
+        settled_at = 0.0
         started = time.time()
         max_wall = 3 * 3600
 
+        # 平台记的是真实在线时长，倍速播完 wall-clock 只走了一半，任务点照样不通过。
+        # 读不到倍速限制也按 1.0 保守处理。
+        try:
+            lim = await self._eval(JS_LIMIT)
+            cap = float((lim or {}).get("rate") or 1.0)
+            if rate > cap:
+                log.info("按平台限制把倍速从 " + str(rate) + " 降到 " + str(cap))
+                rate = cap
+                force = force and cap >= 1.5
+        except Exception:
+            pass
+
         if force:
             await self._install_guard(rate)
+
+        # 先点播放器的播放按钮，让它的初始化 + 上报流程正常跑起来
+        if self.cfg.get("click_play", True):
+            try:
+                hit = await self._eval(JS_CLICK_PLAY)
+                if hit:
+                    log.info("已点击播放器按钮起播: " + str(hit))
+                    await asyncio.sleep(1.5)
+            except Exception:
+                pass
 
         while True:
             if self.gate is not None:
@@ -169,7 +247,22 @@ class VideoEngine:
                     self.on_progress(min(t / d, 1.0))
                 except Exception:
                     pass
-            if d and t / d >= settle:
+            # 超星按 playingTime >= duration 判定，差一秒都可能不算。
+            # 所以要么到比例阈值，要么已经贴到结尾
+            # 平台按 playingTime >= duration 判通过，差半秒都可能不算，必须贴到结尾
+            if d and (t / d >= settle or (d - t) <= 0.2):
+                # 别急着收工：让播放器把最后一段心跳发完，平台那边才算得满学习时长
+                if not settled_at:
+                    settled_at = time.time()
+                    log.info("已达完成阈值 " + str(round(t / d * 100, 1)) +
+                             "%，等待平台同步学习时长")
+                if time.time() - settled_at < 12:
+                    try:
+                        await self._eval(JS_DRIVE, {"rate": rate, "mute": mute})
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.0)
+                    continue
                 ratio = t / d
                 return TaskResult(task, True, "进度 " + str(round(ratio * 100, 1)) + "%", ratio)
             if state.get("ended"):
@@ -184,7 +277,8 @@ class VideoEngine:
                 stalls += 1
                 if stalls % 5 == 0:
                     log.debug("进度停滞 " + str(stalls) + " 次，当前 " + str(round(t, 1)) + "s")
-                if stalls % 3 == 0:
+                # 课程写了"不可拖拽"时，nudge 反而会让这一节作废，宁可就地重载
+                if stalls % 3 == 0 and self.cfg.get("allow_nudge", False):
                     try:
                         await self._eval(JS_NUDGE)
                     except Exception:

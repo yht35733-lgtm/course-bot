@@ -14,6 +14,7 @@ browser:
   timezone: Asia/Shanghai
   viewport: {width: 1440, height: 900}
   navigation_timeout: 45000
+  login_wait: 900             # 扫码登录最长等待秒数
 
 video:
   rate: 1.5                   # 目标倍速，不建议超过 2.0
@@ -33,13 +34,40 @@ quiz:
   retry_wrong: 1
   delay_between: 1.2
 
-llm:                          # 题库未命中时的兜底（任意 OpenAI 兼容接口）
-  enabled: false
-  base_url: https://api.openai.com/v1
+llm:                          # 联网模型答题（题库未命中时使用）
+  enabled: true
   api_key: ""                 # 或用环境变量 COURSEBOT_LLM_KEY
-  model: gpt-4o-mini
+
+  # ---- 选一个后端：改 base_url 和 model 即可，协议都是 OpenAI 兼容 ----
+  # DeepSeek（便宜，中文理科题稳）
+  base_url: https://api.deepseek.com/v1
+  model: deepseek-chat
+
+  # 通义千问
+  # base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  # model: qwen-plus
+
+  # 智谱 GLM
+  # base_url: https://open.bigmodel.cn/api/paas/v4
+  # model: glm-4-flash
+
+  # Kimi
+  # base_url: https://api.moonshot.cn/v1
+  # model: moonshot-v1-8k
+
+  # Perplexity（原生联网检索，冷门课、新题更准）
+  # base_url: https://api.perplexity.ai
+  # model: sonar
+
+  # OpenAI
+  # base_url: https://api.openai.com/v1
+  # model: gpt-4o-mini
+
   temperature: 0
-  timeout: 60
+  timeout: 90
+  retries: 2
+  max_tokens: 2000
+  min_confidence: 0.0         # 模型自评低于该值就不采用，改记入 pending
 
 runner:
   courses: []                 # 按名称关键词过滤，例 ["高等数学"]；留空 = 全部

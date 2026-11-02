@@ -18,15 +18,21 @@ class Progress:
                 self.data = {}
 
     @staticmethod
-    def key(platform: str, cid: str, tid: str) -> str:
-        return platform + ":" + str(cid) + ":" + str(tid)
+    def key(platform: str, cid: str, tid: str, job=None) -> str:
+        k = platform + ":" + str(cid) + ":" + str(tid)
+        return k if job is None else k + ":" + str(job)
 
-    def is_done(self, platform: str, cid: str, tid: str) -> bool:
-        rec = self.data.get(self.key(platform, cid, tid))
+    def is_done(self, platform: str, cid: str, tid: str, job=None) -> bool:
+        rec = self.data.get(self.key(platform, cid, tid, job))
         return bool(rec and rec.get("status") == "done")
 
-    def mark(self, platform: str, cid: str, tid: str, status: str, detail: str = "") -> None:
-        self.data[self.key(platform, cid, tid)] = {"status": status, "detail": detail}
+    def status(self, platform: str, cid: str, tid: str, job=None) -> str:
+        rec = self.data.get(self.key(platform, cid, tid, job))
+        return (rec or {}).get("status", "")
+
+    def mark(self, platform: str, cid: str, tid: str, status: str, detail: str = "",
+             job=None) -> None:
+        self.data[self.key(platform, cid, tid, job)] = {"status": status, "detail": detail}
         self.save()
 
     def save(self) -> None:

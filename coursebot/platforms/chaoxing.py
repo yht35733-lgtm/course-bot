@@ -43,9 +43,15 @@ class ChaoxingAdapter(PlatformAdapter):
     QUESTION_ITEM = ".questionLi, .TiMu, .question-item"
     QUESTION_STEM = ".Zy_TItle, .mark_name, .question-title"
     QUESTION_OPTION = "li, .answer_p, .option"
-    SUBMIT_BTN = ".completeBtn, a.completeBtn, #tempsave, .Btn_blue"
+    # 超星作业页两个按钮：.btnSave=暂时保存（noSubmit()），.btnSubmit=提交（btnBlueSubmit()）。
+    # 之前的选择器没含 .btnSubmit，反而点到了保存，作业只存草稿，任务点永远不变绿。
+    SUBMIT_BTN = (".btnSubmit, .completeBtn, a:has-text('提交'),"
+                  " button:has-text('提交'), a:has-text('交卷')")
+    QUIZ_CLOSE = (".ans-videoquiz-close, .ans-videoquiz .close, .popClose,"
+                  " .layui-layer-close, .close-btn")
 
-    SESSION_COOKIES = ("_uid", "UID", "id")
+    # 只认真正的用户票据；别把随便一个叫 id 的 cookie 当成登录成功
+    SESSION_COOKIES = ("_uid", "UID")
 
     # ---------------- 登录态 ----------------
 
@@ -60,6 +66,32 @@ class ChaoxingAdapter(PlatformAdapter):
     async def is_logged_in(self) -> bool:
         names = await self.session_cookies()
         return any(n in names for n in self.SESSION_COOKIES)
+
+    async def verify_login(self) -> bool:
+        """票据可能是上一轮留下的空壳：开个临时标签页真请求一次课程页。
+
+        被重定向到 passport 就说明服务端不认，不能算登录成功。
+        """
+        try:
+            ctx = self.page.context
+        except Exception:
+            return False
+        probe = None
+        try:
+            probe = await ctx.new_page()
+            await probe.goto(self.COURSE_URL, wait_until="domcontentloaded", timeout=25000)
+            await probe.wait_for_timeout(1200)
+            url = (probe.url or "").lower()
+            return not ("passport" in url or "/login" in url)
+        except Exception as e:
+            log.debug("登录验证失败: " + str(e))
+            return False
+        finally:
+            if probe is not None:
+                try:
+                    await probe.close()
+                except Exception:
+                    pass
 
     # ---------------- 课程 ----------------
 
@@ -167,6 +199,42 @@ class ChaoxingAdapter(PlatformAdapter):
         log.info("课程「" + course.name + "」发现 " + str(len(tasks)) + " 个小节")
         return tasks
 
+    # 顶部那排「1视频 / 2章节测验」是任务点分组标签，测验藏在第二个标签后面
+    JS_TABS = """
+() => Array.from(document.querySelectorAll('#prev_tab li, .prev_tab li, #prev_list li')).map(function (li, i) {
+  return { i: i,
+           text: (li.innerText || '').replace(/\s+/g, '').slice(0, 20),
+           active: /active/.test(li.className || '') };
+})
+"""
+
+    async def job_tabs(self) -> list[dict]:
+        """分组的 li 不一定在顶层文档里，逐个 frame 找。"""
+        for attempt in range(3):
+            for f in self.page.frames:
+                try:
+                    res = await f.evaluate(self.JS_TABS)
+                except Exception:
+                    continue
+                if res and len(res) > 0:
+                    self._tabs_frame = f
+                    log.info("任务点分组: " + " / ".join(t["text"] for t in res))
+                    return res
+            await self.page.wait_for_timeout(1500)
+        return []
+
+    async def switch_job_tab(self, index: int) -> bool:
+        frame = getattr(self, "_tabs_frame", None) or self.page
+        try:
+            li = frame.locator("#prev_tab li, .prev_tab li, #prev_list li").nth(index)
+            await li.scroll_into_view_if_needed(timeout=4000)
+            await li.click(timeout=6000)
+            await self.page.wait_for_timeout(2800)
+            return True
+        except Exception as e:
+            log.warning("切换任务点标签失败: " + str(e))
+            return False
+
     async def open_task(self, task: Task) -> Optional[Any]:
         """点击小节标题，返回真正承载播放器/题目的 frame。"""
         frame = await self.catalog_frame()
@@ -180,9 +248,21 @@ class ChaoxingAdapter(PlatformAdapter):
             log.warning("点击小节失败: " + str(e))
             return None
         await self.page.wait_for_timeout(3000)
+        # 播放器 / 任务点卡片都在 knowledge/cards 这个 iframe 里，
+        # 按 URL 找最稳；退回 #frame_content 常常拿到的是外面那层学习页
+        for f in self.page.frames:
+            if "knowledge/cards" in (f.url or ""):
+                return f
         return await self.content_frame(self.page)
 
     # ---------------- 答题 ----------------
+
+    def decode(self, text: str) -> str:
+        """把字体反爬的乱码还原成真字。"""
+        m = getattr(self, "font_map", None)
+        if not m or not text:
+            return text
+        return "".join(m.get(ch, ch) for ch in text)
 
     async def extract_questions(self, page) -> list[Question]:
         questions: list[Question] = []
@@ -215,6 +295,7 @@ class ChaoxingAdapter(PlatformAdapter):
             if not stem:
                 stem = await self.text_of(root)
             stem = re.sub(r"^\d+[\.、\s]*", "", stem).strip()
+            stem = self.decode(stem)
             if not stem:
                 continue
 
@@ -226,7 +307,7 @@ class ChaoxingAdapter(PlatformAdapter):
                     o = opt_loc.nth(j)
                     t = await self.text_of(o)
                     if t and len(t) < 200:
-                        opts.append(t)
+                        opts.append(self.decode(t))
                         nodes.append(o)
             except Exception:
                 pass
@@ -280,23 +361,61 @@ class ChaoxingAdapter(PlatformAdapter):
             await page.wait_for_timeout(200)
 
     async def submit_quiz(self, page) -> bool:
+        """先点提交；被风控拦下就退而点「暂时保存」，至少别丢答案。"""
+        ok = await self._try_submit(page)
+        if not ok:
+            log.warning("提交被拦（/work/validate 判账号异常），改为点「暂时保存」")
+            await self._try_save(page)
+        return ok
+
+    async def _try_submit(self, page) -> bool:
         for sel in self.SUBMIT_BTN.split(","):
             sel = sel.strip()
             if not sel:
                 continue
             try:
                 btn = page.locator(sel).first
-                if await btn.count():
-                    await btn.click(timeout=5000)
-                    await page.wait_for_timeout(2500)
+                if not await btn.count():
+                    continue
+                if not await self.safe_click(btn):
+                    log.warning("提交按钮点不动: " + sel)
+                    continue
+                await page.wait_for_timeout(3000)
+                for csel in ("button:has-text('确定')", "a:has-text('确定')",
+                             "button:has-text('确认')", "a:has-text('确认')",
+                             ".layui-layer-btn0", ".popDiv a", ".btnSure", ".sureBtn"):
                     try:
-                        confirm = page.locator(
-                            ".popDiv a, .layui-layer-btn0, button:has-text('确定')").first
-                        if await confirm.count():
-                            await confirm.click(timeout=2500)
+                        c = page.locator(csel).first
+                        if await c.count() and await c.is_visible():
+                            await self.safe_click(c)
                             await page.wait_for_timeout(2000)
+                            break
                     except Exception:
-                        pass
+                        continue
+                # 被判账号异常时按钮还在、页面也不跳
+                try:
+                    body = (await page.inner_text("body"))[:4000]
+                    if "账号异常" in body:
+                        return False
+                except Exception:
+                    pass
+                try:
+                    return not await btn.is_visible()
+                except Exception:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _try_save(self, page) -> bool:
+        # 兜底：提交被拦时至少把答案存下来，下次能接着答
+        for sel in (".btnSave, .workBtnIndex", ".btnSave"):
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() and await btn.is_visible():
+                    await self.safe_click(btn)
+                    await page.wait_for_timeout(1500)
+                    log.info("已保存草稿")
                     return True
             except Exception:
                 continue

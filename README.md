@@ -261,11 +261,15 @@ python main.py run     --course 电工基础 --dry             # 只侦察不执
 python main.py run     --course 电工基础 --max-tasks 3     # 跑 3 个小节
 python main.py run     --course 电工基础 --duration 2h     # 跑两小时
 python main.py run     --kind video                       # 只刷视频
+python main.py run     --task 3.3.1.2 --force             # 单独补某一节
 python main.py run     --reset                            # 清空进度重来
+python main.py check   --course 电工基础                   # 逐节核对平台任务点
+python main.py audit   --course 电工基础                   # 快速看还差多少
 python main.py serve   --port 8000                        # Web 控制台
 python main.py doctor                                     # 环境自检
 ```
-Windows 上双击 `start-cli.bat` 有菜单版。
+
+`run` 默认会先跑一次 `check` 把本地记录和平台状态对齐（`--no-check` 跳过）。
 
 ---
 
@@ -380,6 +384,16 @@ python scripts/demo_run.py   # 本地模拟平台跑通完整链路，不需要�
 
 
 ## 已知限制
+
+- **1 倍速**。平台按真实在线时长记学习进度，加速播完 wall-clock 只走一半，
+  任务点照样不通过。读不到课程的 `doublespeed` 限制时按 1.0 保守处理。
+- **测验提交可能被风控拦**。提交前会先打 `/work/validate`，返回 `status=1`
+  就判「账号异常」直接拦下，答题再快也交不上去。这时程序会退回点「暂时保存」，
+  任务点记成 `submit_blocked`，需要你稍后手动提交。
+- **字体反爬解码约 92%**。超星把题目文字映射成生僻字再重绘字形，
+  程序靠字形比对还原，形近字（宫/官、顶/预）会认错，模型能按语义纠回来。
+- **视频任务点状态有延迟**。播完不等于立刻变绿，程序处理完会重进一次核对，
+  连续两轮不过就标 `platform_reject`，不再无限重播。
 
 - **任务点之间不会自动跳转**。超星一个 `.catalog_title` 下常挂多个任务点（视频 / 文档 / 讨论），目前处理进入小节后看到的第一个视频或测验。
 - **单题级的对错回读只有弹题支持**。章节测验提交后只能读到总分，无法把每题对错回写题库。
