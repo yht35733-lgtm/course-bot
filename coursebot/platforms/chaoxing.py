@@ -136,7 +136,7 @@ class ChaoxingAdapter(PlatformAdapter):
             url = course.url if course.url.startswith("http") else urljoin(self.COURSE_URL, course.url)
             try:
                 await self.page.goto(url, wait_until="domcontentloaded")
-                await self.page.wait_for_timeout(2500)
+                await self.page.wait_for_timeout(1200)
             except Exception as e:
                 log.warning("直接打开课程失败: " + str(e))
         else:
@@ -156,7 +156,7 @@ class ChaoxingAdapter(PlatformAdapter):
                 loc = self.page.get_by_text(label, exact=True).first
                 if await loc.count():
                     await loc.click(timeout=6000)
-                    await self.page.wait_for_timeout(2500)
+                    await self.page.wait_for_timeout(1200)
                     return
             except Exception:
                 continue
@@ -223,46 +223,99 @@ class ChaoxingAdapter(PlatformAdapter):
             await self.page.wait_for_timeout(1500)
         return []
 
+    TABS_SEL = "#prev_tab li, .prev_tab li, #prev_list li"
+
     async def switch_job_tab(self, index: int) -> bool:
-        frame = getattr(self, "_tabs_frame", None) or self.page
-        try:
-            li = frame.locator("#prev_tab li, .prev_tab li, #prev_list li").nth(index)
-            await li.scroll_into_view_if_needed(timeout=4000)
-            await li.click(timeout=6000)
-            await self.page.wait_for_timeout(2800)
-            return True
-        except Exception as e:
-            log.warning("切换任务点标签失败: " + str(e))
-            return False
+        """点分组标签。
+
+        两个坑：缓存的 _tabs_frame 换小节后会失效（element is not visible），
+        有些皮肤把标签条整条隐藏，Playwright 的 click 判不可见直接超时。
+        所以每次都重新找 frame，点不动就退回 JS 的 el.click()。
+        """
+        for _ in range(3):
+            for f in self.page.frames:
+                try:
+                    li = f.locator(self.TABS_SEL).nth(index)
+                    if not await li.count():
+                        continue
+                except Exception:
+                    continue
+                try:
+                    await li.click(timeout=3000)
+                except Exception:
+                    try:
+                        await li.evaluate("el => el.click()")
+                    except Exception:
+                        continue
+                self._tabs_frame = f
+                await self.page.wait_for_timeout(2500)
+                return True
+            await self.page.wait_for_timeout(800)
+        log.warning("切换任务点标签失败: index=" + str(index) + "（找不到可点的 li）")
+        return False
+
+    async def _wait_learning_frame(self, seconds: int):
+        """轮询等 knowledge/cards 出现。
+
+        目录点击会整页跳到 studentstudy，frame 是新的，必须每秒重扫。
+        """
+        for _ in range(max(1, seconds)):
+            await self.page.wait_for_timeout(1000)
+            for f in self.page.frames:
+                if "knowledge/cards" in (f.url or ""):
+                    return f
+        return None
 
     async def open_task(self, task: Task) -> Optional[Any]:
-        """点击小节标题，返回真正承载播放器/题目的 frame。"""
+        """点击小节标题，返回真正承载播放器/题目的 frame。
+
+        坑：Playwright 的 click 会等"点击引发的导航"结束才算完。超星目录点一下
+        就是整页跳 studentstudy，8 秒预算常常只等到一半，于是报 Timeout——
+        其实页面早就打开了。改用 JS 点击（不等导航），自己轮询目标 frame。
+        """
         frame = await self.catalog_frame()
         if frame is None:
             return None
         idx = int(task.meta.get("index", 0))
+        node = frame.locator(self.TASK_ITEM).nth(idx)
+
+        fired = False
         try:
-            node = frame.locator(self.TASK_ITEM).nth(idx)
-            await node.click(timeout=8000)
+            await node.evaluate("el => el.click()")
+            fired = True
         except Exception as e:
-            log.warning("点击小节失败: " + str(e))
-            return None
-        await self.page.wait_for_timeout(3000)
-        # 播放器 / 任务点卡片都在 knowledge/cards 这个 iframe 里，
-        # 按 URL 找最稳；退回 #frame_content 常常拿到的是外面那层学习页
-        for f in self.page.frames:
-            if "knowledge/cards" in (f.url or ""):
-                return f
-        return await self.content_frame(self.page)
+            log.warning("JS 点击小节失败: " + str(e).split("\n")[0])
+
+        target = await self._wait_learning_frame(6)
+        if target is None:
+            try:
+                # no_wait_after 让 Playwright 别等导航，点完立刻返回
+                await node.click(timeout=8000, no_wait_after=True)
+                fired = True
+            except Exception as e:
+                log.warning("点击小节超时: " + str(e).split("\n")[0])
+            target = await self._wait_learning_frame(8)
+
+        if target is None:
+            if not fired:
+                return None
+            log.warning("小节已点击但没等到 learning frame，按当前页面继续")
+            return await self.content_frame(self.page)
+        return target
 
     # ---------------- 答题 ----------------
 
     def decode(self, text: str) -> str:
-        """把字体反爬的乱码还原成真字。"""
+        """把字体反爬的乱码还原成真字。
+
+        映射表里给的是康熙部首（⼀ ⽇ ⽯），和真字看着一样但编码不同，
+        模型对这两套字符的理解有偏差，统一转成普通汉字。
+        """
+        from ..fontdecode import KX_TAB
         m = getattr(self, "font_map", None)
         if not m or not text:
             return text
-        return "".join(m.get(ch, ch) for ch in text)
+        return "".join(m.get(ch, ch) for ch in text).translate(KX_TAB)
 
     async def extract_questions(self, page) -> list[Question]:
         questions: list[Question] = []
@@ -360,65 +413,194 @@ class ChaoxingAdapter(PlatformAdapter):
                     log.warning("选项点击失败: 第" + str(idx) + "项")
             await page.wait_for_timeout(200)
 
+    # 直接调超星自己的提交函数：点按钮会被顶层遮罩（章节详情顶栏 / #workpop）
+    # 拦住，Playwright 一直重试到超时，最后什么都没发出去。
+    # 提交的真正开关在 submitCheckTimes()：它把 form1 POST 到 addStudentWorkNewWeb。
+    # 直接调它会报「无效的参数：code-1」，因为 toadd() 会先把已答题目 id 写进
+    # #answerwqbid；而 toadd 只在 btnBlueSubmit() -> /work/validate -> 确认框
+    # 这条链里被调用，确认框又是 top.workPop() 弹出的，抓不到也点不到。
+    # 所以这里手动补齐 toadd 做的那几个字段，再直接提交。
+    JS_SUBMIT = """
+() => {
+  try {
+    ['setClozeTextAnswers', 'setConnLineAnswer', 'setSortQuesAnswer', 'setAllClozeAnswer',
+     'setReadComprehensionAnswer', 'setProceduralAnswer', 'updateAllFillinBlanksData'
+    ].forEach(function (n) {
+      try { if (typeof window[n] === 'function') window[n](); } catch (e) {}
+    });
+    var ids = Array.prototype.slice.call(document.querySelectorAll('[id^="answertype"]'))
+      .map(function (n) { return n.id.replace('answertype', ''); })
+      .filter(function (s) { return /^[0-9]+$/.test(s); });
+    if (!ids.length) return '';
+    var wq = document.getElementById('answerwqbid');
+    if (wq) wq.value = ids.join(',') + ',';
+    var pf = document.getElementById('pyFlag');
+    if (pf) pf.value = '';
+    if (typeof submitCheckTimes === 'function') { submitCheckTimes(); return 'direct'; }
+  } catch (e) {}
+  return '';
+}
+"""
+
+    JS_SAVE = """
+() => {
+  try { if (typeof noSubmit === 'function') { noSubmit(); return 'js'; } } catch (e) {}
+  const el = document.querySelector('.btnSave');
+  if (el) { el.click(); return 'el'; }
+  return '';
+}
+"""
+
+    # 视频弹题（ananas 播放器自带的那套）没有 submitCheckTimes / btnBlueSubmit，
+    # 只有自己的提交按钮，点完弹层就收。用章测那套提交必然扑空并反复暂停视频。
+    POPUP_SUBMIT = (".ans-videoquiz-submit, .ans-videoquiz-btn, .ans-videoquiz .sub-btn,"
+                    " .videoquiz-submit, .ans-videoquiz input[type=submit]")
+
+    JS_POPUP_SUBMIT = """
+() => {
+  const box = document.querySelector('.ans-videoquiz, .videoquiz, #videoquiz');
+  const scope = box || document;
+  const nodes = Array.prototype.slice.call(
+    scope.querySelectorAll('a, button, input[type=submit], span, div'));
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    if (n.children.length) continue;
+    const t = (n.innerText || n.value || '').replace(/\s+/g, '');
+    if (t === '提交' || t === '确定' || t === '提交答案') { n.click(); return 'text:' + t; }
+  }
+  const el = scope.querySelector('.ans-videoquiz-submit, .ans-videoquiz-btn');
+  if (el) { el.click(); return 'sel'; }
+  if (box) {
+    // 有些版本选完选项就自动交卷，直接触发一次 change 兜底
+    const last = box.querySelector('input:checked');
+    if (last) { last.dispatchEvent(new Event('change', {bubbles: true})); return 'change'; }
+  }
+  return '';
+}
+"""
+
+    async def submit_popup_quiz(self, page) -> bool:
+        await self.clear_mask(page)
+        fired = ""
+        try:
+            fired = await page.evaluate(self.JS_POPUP_SUBMIT)
+        except Exception as e:
+            log.debug("弹题提交 JS 失败: " + str(e))
+        if not fired:
+            for sel in self.POPUP_SUBMIT.split(","):
+                sel = sel.strip()
+                if not sel:
+                    continue
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() and await self.safe_click(btn):
+                        fired = sel
+                        break
+                except Exception:
+                    continue
+        if not fired:
+            return False
+        log.info("弹题已提交: " + str(fired))
+        await page.wait_for_timeout(1500)
+        return True
+
     async def submit_quiz(self, page) -> bool:
-        """先点提交；被风控拦下就退而点「暂时保存」，至少别丢答案。"""
+        """先提交；提交不成功就退而点「暂时保存」，至少别丢答案。"""
         ok = await self._try_submit(page)
         if not ok:
-            log.warning("提交被拦（/work/validate 判账号异常），改为点「暂时保存」")
+            log.warning("提交没成功，改为点「暂时保存」保住答案")
             await self._try_save(page)
+        # 提交/保存后都会弹层，遮罩不清掉页面就滑不动了
+        await self.clear_mask(page)
         return ok
 
-    async def _try_submit(self, page) -> bool:
-        for sel in self.SUBMIT_BTN.split(","):
-            sel = sel.strip()
-            if not sel:
-                continue
+    async def _confirm_dialog(self, page) -> None:
+        """交卷确认 / 保存提示 / 验证码弹层，挨个点「确定」。"""
+        for sel in ("#submitBackOk", ".layui-layer-btn0", ".bluebtn",
+                    "a:has-text('确定')", "button:has-text('确定')",
+                    "a:has-text('确认')", "button:has-text('确认')"):
             try:
-                btn = page.locator(sel).first
-                if not await btn.count():
-                    continue
-                if not await self.safe_click(btn):
-                    log.warning("提交按钮点不动: " + sel)
-                    continue
-                await page.wait_for_timeout(3000)
-                for csel in ("button:has-text('确定')", "a:has-text('确定')",
-                             "button:has-text('确认')", "a:has-text('确认')",
-                             ".layui-layer-btn0", ".popDiv a", ".btnSure", ".sureBtn"):
-                    try:
-                        c = page.locator(csel).first
-                        if await c.count() and await c.is_visible():
-                            await self.safe_click(c)
-                            await page.wait_for_timeout(2000)
-                            break
-                    except Exception:
-                        continue
-                # 被判账号异常时按钮还在、页面也不跳
-                try:
-                    body = (await page.inner_text("body"))[:4000]
-                    if "账号异常" in body:
-                        return False
-                except Exception:
-                    pass
-                try:
-                    return not await btn.is_visible()
-                except Exception:
-                    return True
+                c = page.locator(sel).first
+                if await c.count() and await c.is_visible():
+                    await self.safe_click(c)
+                    await page.wait_for_timeout(1500)
+                    return
             except Exception:
                 continue
-        return False
+
+    async def _try_submit(self, page) -> bool:
+        await self.clear_mask(page)
+        fired = ""
+        try:
+            fired = await page.evaluate(self.JS_SUBMIT)
+        except Exception as e:
+            log.debug("JS 提交调用失败: " + str(e))
+        if not fired:
+            # 兜底：走超星自己的确认链（有些皮肤 JS 函数名不一样）
+            try:
+                fired = await page.evaluate(
+                    "() => { try { btnBlueSubmit(); return 'btn'; } catch (e) { return ''; } }")
+            except Exception:
+                fired = ""
+        if not fired:
+            for sel in (".btnSubmit", ".completeBtn"):
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() and await self.safe_click(btn):
+                        fired = "click"
+                        break
+                except Exception:
+                    continue
+        if not fired:
+            log.warning("提交入口没找到（submitCheckTimes / btnBlueSubmit 都不可用）")
+            return False
+        log.info("已触发提交: " + fired)
+
+        await page.wait_for_timeout(3500)
+        await self._confirm_dialog(page)
+        await page.wait_for_timeout(2500)
+
+        # 提交成功会跳成绩页，按钮也就消失了
+        try:
+            url = (getattr(page, "url", "") or "")
+        except Exception:
+            url = ""
+        if "selectWorkQuestion" in url or "viewWork" in url:
+            return True
+        try:
+            body = (await page.inner_text("body"))[:6000]
+        except Exception:
+            body = ""
+        if "账号异常" in body:
+            return False
+        if "无效的参数" in body:
+            log.warning("提交被服务端拒绝：无效的参数")
+            return False
+        try:
+            btn = page.locator(".btnSubmit").first
+            if await btn.count():
+                return not await btn.is_visible()
+        except Exception:
+            pass
+        return True
 
     async def _try_save(self, page) -> bool:
-        # 兜底：提交被拦时至少把答案存下来，下次能接着答
-        for sel in (".btnSave, .workBtnIndex", ".btnSave"):
-            try:
-                btn = page.locator(sel).first
-                if await btn.count() and await btn.is_visible():
-                    await self.safe_click(btn)
-                    await page.wait_for_timeout(1500)
-                    log.info("已保存草稿")
-                    return True
-            except Exception:
-                continue
+        # 兜底：提交没成功时至少把答案存下来，下次能接着答
+        try:
+            if await page.evaluate(self.JS_SAVE):
+                await page.wait_for_timeout(1500)
+                log.info("已保存草稿")
+                return True
+        except Exception:
+            pass
+        try:
+            btn = page.locator(".btnSave").first
+            if await btn.count() and await self.safe_click(btn):
+                await page.wait_for_timeout(1500)
+                log.info("已保存草稿")
+                return True
+        except Exception:
+            pass
         return False
 
     async def read_quiz_result(self, page, questions: list[Question]) -> None:

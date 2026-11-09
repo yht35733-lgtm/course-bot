@@ -8,6 +8,7 @@ from typing import Optional
 
 from .bank import Bank
 from .browser import BrowserSession
+from .checkup import JS_JOB_STATUS, JS_PENDING, collect_jobs, sync_catalog
 from .config import ROOT
 from .logger import log
 from .models import Course, Task, TaskResult
@@ -32,6 +33,27 @@ class Runner:
         self.progress = Progress(ROOT / "data" / "progress.json")
         self.state = state or RunState()
         self.stats = self.state.stats
+        self._pend_hint = None      # 目录里这一节还差几个任务点（None=未知）
+
+    @staticmethod
+    def _tid_index(task: Task) -> int:
+        tid = task.tid or ""
+        if tid.startswith("ch") and tid[2:].isdigit():
+            return int(tid[2:])
+        return -1
+
+    async def _pending_map(self, adapter) -> dict[int, int]:
+        """目录里每节还差几个任务点。只有带计数元素的节才进表。"""
+        try:
+            frame = await adapter.catalog_frame()
+            if frame is None:
+                return {}
+            rows = await frame.evaluate(JS_PENDING)
+        except Exception as e:
+            log.debug("读目录计数失败: " + str(e))
+            return {}
+        return {int(r["i"]): int(r.get("pending") or 0)
+                for r in rows if r.get("has")}
 
     # ---------------- 控制 ----------------
 
@@ -133,6 +155,14 @@ class Runner:
         log.info("=" * 12 + " 课程: " + course.name + " " + "=" * 12)
         await adapter.open_course(course)
         tasks = await adapter.list_tasks(course)
+        # 本地 progress 被旧逻辑污染过（只差测验的节被标成 done），跑之前
+        # 先用目录的"待完成任务点"计数校准一遍，否则一路"跳过已完成"
+        try:
+            await sync_catalog(adapter, course, self.progress, self.platform,
+                               self.cfg["runner"].get("only_task") or None)
+        except Exception as e:
+            log.warning("目录校准失败: " + str(e))
+        pmap = await self._pending_map(adapter)
 
         if self.only_kind and self.only_kind != "mixed":
             tasks = [t for t in tasks if t.kind == self.only_kind or t.kind == "mixed"]
@@ -150,10 +180,21 @@ class Runner:
             if self.stopped:
                 break
             st.task_index = i
-            if (not self.cfg["runner"].get("ignore_done")
-                    and self.progress.is_done(self.platform, course.cid, task.tid)):
-                log.info("跳过已完成 [" + task.kind + "] " + task.title)
-                continue
+            pend = pmap.get(self._tid_index(task))
+            local_done = (not self.cfg["runner"].get("ignore_done")
+                          and self.progress.is_done(self.platform, course.cid, task.tid))
+            if local_done:
+                if pend is None:
+                    log.info("跳过已完成 [" + task.kind + "] " + task.title)
+                    continue
+                if pend == 0:
+                    log.info("跳过已完成 [" + task.kind + "] " + task.title +
+                             "（目录无待完成任务点）")
+                    continue
+                log.warning("本地记着完成，但平台还差 " + str(pend) +
+                            " 个任务点，重跑: " + task.title)
+                self.progress.mark(self.platform, course.cid, task.tid, "stale",
+                                   "平台还差 " + str(pend) + " 个任务点")
             # 上限算的是"这一轮真跑了几个"，跳过的不占名额
             if limit and ran >= limit:
                 log.info("已达到本轮上限 " + str(limit) + " 个任务，停止")
@@ -167,6 +208,7 @@ class Runner:
                     log.warning("重开课程失败: " + str(e))
             if self.stopped:
                 break
+            self._pend_hint = pend
             try:
                 res = await self.handle_task(adapter, course, task)
             except Exception as e:
@@ -223,9 +265,10 @@ class Runner:
                 all_frames = list(owner.frames)
             except Exception:
                 all_frames = []
-            outcome = await self.quiz.run_page(adapter, frame, frames=all_frames)
+            # popup=True：弹题有自己的提交按钮，也不需要等风控延时
+            outcome = await self.quiz.run_page(adapter, frame, frames=all_frames, popup=True)
             st.phase = "video"
-            if outcome.answered > 0 or outcome.submitted:
+            if outcome.submitted or (outcome.total and outcome.answered >= outcome.total):
                 return True
             # 答不上就关掉弹题，否则视频永远停在这儿，整个章节都别想完成
             log.warning("弹题未能作答（" + outcome.detail + "），关闭弹题继续播放")
@@ -296,56 +339,82 @@ class Runner:
 
         details: list[str] = []
         ok_any = False
-
-        # 顶部「1视频 / 2章节测验」是分组标签，测验藏在第二个标签后面，
-        # 不切过去就永远只看到视频。逐个标签处理。
-        tabs = []
-        try:
-            tabs = await adapter.job_tabs()
-        except Exception:
-            tabs = []
-        if len(tabs) > 1:
-            log.info("本节有 " + str(len(tabs)) + " 组任务点: " +
-                     " / ".join(t["text"] for t in tabs))
-
-        details: list[str] = []
-        ok_any = False
+        seen = 0
         page = getattr(target, "page", target)
 
-        for i in range(max(1, len(tabs))):
+        # 顶部「1学习目标 / 2视频 / 3章节测验」是分组标签，测验藏在最后一组，
+        # 不切过去就永远只看见视频。逐组处理，并且每组单独打日志，方便定位。
+        try:
+            tabs = await adapter.job_tabs() or []
+        except Exception:
+            tabs = []
+        if not tabs:
+            tabs = [{"i": -1, "text": "默认"}]
+        if len(tabs) > 1:
+            log.info("本节 " + str(len(tabs)) + " 组任务点: " +
+                     " / ".join(str(t["text"]) for t in tabs))
+
+        for t in tabs:
             if self.stopped:
                 break
-            if len(tabs) > 1:
-                if not await adapter.switch_job_tab(tabs[i]["i"]):
-                    continue
-                log.info("切到任务点组: " + str(tabs[i]["text"]))
-                await asyncio.sleep(1.8)
+            idx = int(t.get("i", -1))
+            switched = True
+            # 只有一组时当前页面就是它，去切反而会撞上隐藏的 li
+            if len(tabs) > 1 and idx >= 0:
+                switched = await adapter.switch_job_tab(idx)
+                if not switched:
+                    log.warning("切到分组「" + str(t["text"]) + "」失败，改按当前页面继续读")
+                await asyncio.sleep(1.5)
                 target = await adapter.content_frame(page)
-            got, det = await self._drain_jobs(adapter, course, task, target)
-            ok_any = ok_any or got
-            details.extend(det)
+            jobs = await self._list_jobs(target)
+            left = [j for j in jobs if not j["done"]]
+            log.info("分组「" + str(t["text"]) + "」读到 " + str(len(jobs)) +
+                     " 个任务点，未完成 " + str(len(left)))
+            if jobs:
+                seen += len(jobs)
+                got, det = await self._drain_jobs(adapter, course, task, target, jobs,
+                                                  tab_key=str(idx))
+                ok_any = ok_any or got
+                details.extend(det)
+            if not switched:
+                # 后面几组也切不动，读到的还是同一页，重复处理没意义
+                break
 
-        if details:
-            await self.reconcile(adapter, course, task)
-        if not details:
+        if not seen:
+            # 读不到任务点 != 做完了。平台说还差就必须报失败，否则整节被误标 green
+            hint = self._pend_hint or 0
+            if hint > 0:
+                log.warning("本节平台还差 " + str(hint) + " 个任务点，但页面上读不到任务点")
+                self.stats["skipped"] += 1
+                return TaskResult(task, False, "任务点读不到（平台还差 " + str(hint) + "）")
+            log.info("本节没有任务点")
             self.stats["skipped"] += 1
-            return TaskResult(task, True, "无任务点，跳过")
-        return TaskResult(task, ok_any, "; ".join(details))
+            return TaskResult(task, True, "无任务点")
 
-    async def _drain_jobs(self, adapter, course, task, target) -> tuple[bool, list[str]]:
-        """把当前标签下的任务点逐个做完，结果按任务点粒度写进 progress。"""
+        await self.reconcile(adapter, course, task)
+        return TaskResult(task, ok_any, "; ".join(details) or "已处理")
+
+    async def _drain_jobs(self, adapter, course, task, target, jobs: list[dict],
+                         tab_key: str = "0") -> tuple[bool, list[str]]:
+        """把当前分组下的任务点逐个做完，结果按任务点粒度写进 progress。
+
+        job 键带分组前缀，否则「视频组第 0 个」和「测验组第 0 个」会互相覆盖。
+        """
         details: list[str] = []
         ok_any = False
-        tried: dict[int, int] = {}
+        tried: dict[str, int] = {}
+
         for _ in range(12):
             if self.stopped:
                 return ok_any, details
-            jobs = await self._list_jobs(target)
-            pending = [j for j in jobs if not j["done"] and tried.get(j["i"], 0) < 2]
+            live = {j["i"] for j in await self._read_jobs(target) if j.get("done")}
+            pending = [j for j in jobs if j["i"] not in live
+                       and tried.get(tab_key + ":" + str(j["i"]), 0) < 2]
             if not pending:
                 break
             job = pending[0]
-            tried[job["i"]] = tried.get(job["i"], 0) + 1
+            jkey = tab_key + ":" + str(job["i"])
+            tried[jkey] = tried.get(jkey, 0) + 1
             log.info("处理任务点 " + str(job["i"] + 1) + "/" + str(len(jobs)) +
                      " 类型 " + job["kind"] + "（剩 " + str(len(pending)) + " 个）")
 
@@ -356,128 +425,136 @@ class Runner:
                 details.append("测验" + ("完成" if done else "未提交"))
                 self.progress.mark(self.platform, course.cid, task.tid,
                                    "done" if done else "submit_blocked",
-                                   "测验已提交" if done else "答题完成但提交被拦",
-                                   job=job["i"])
+                                   "测验已提交" if done else "答题完成但提交被拦", job=jkey)
                 await asyncio.sleep(2.0)
                 continue
 
-            vf, refetch = await self._click_job(target, job)
+            if job["kind"] == "doc":
+                done = await self._do_doc_job(adapter, target, job)
+                ok_any = ok_any or done
+                details.append("文档" + ("完成" if done else "未完成"))
+                self.progress.mark(self.platform, course.cid, task.tid,
+                                   "done" if done else "doc_pending",
+                                   "文档已读" if done else "文档未标记完成", job=jkey)
+                continue
+
+            vf, refetch = await self._click_job(adapter, target, job)
             if vf is None:
                 vf = await self.find_video_frame(target)
             if vf is None:
                 log.info("这个任务点里没有 video，跳过")
+                details.append("视频无播放器")
                 self.progress.mark(self.platform, course.cid, task.tid, "skipped",
-                                   "无视频", job=job["i"])
+                                   "无视频", job=jkey)
                 continue
             res = await self.play_target(adapter, task, vf, refetch=refetch)
             self._count("video", res.ok)
             ok_any = ok_any or res.ok
             details.append("视频" + ("完成" if res.ok else "失败"))
             self.progress.mark(self.platform, course.cid, task.tid,
-                               "done" if res.ok else "failed", res.detail, job=job["i"])
+                               "done" if res.ok else "failed", res.detail, job=jkey)
             await asyncio.sleep(1.5)
 
         return ok_any, details
 
     async def reconcile(self, adapter, course, task) -> None:
-        """重进小节读平台真实状态：全绿就记小节完成，没绿的点出来。"""
+        """重进小节读平台真实状态：全绿就记小节完成，没绿的点出来。
+
+        必须遍历所有分组标签，只看默认组会把「只差测验」误判成全绿。
+        """
         try:
             await adapter.open_course(course)
             target = await adapter.open_task(task)
             if target is None:
                 return
-            jobs = await self._list_jobs(target)
+            page = getattr(target, "page", target)
+            jobs = await collect_jobs(adapter, page)
         except Exception as e:
             log.debug("重进核对失败: " + str(e))
             return
         if not jobs:
+            log.warning("重进核对: 读不到任务点，本节不记为完成")
+            self.progress.mark(self.platform, course.cid, task.tid, "failed",
+                               "重进后读不到任务点")
             return
         still = [j for j in jobs if not j["done"]]
         if not still:
-            self.progress.mark(self.platform, course.cid, task.tid, "done", "全部任务点已完成")
-            log.info("重进核对: 本节任务点已全部变绿")
+            self.progress.mark(self.platform, course.cid, task.tid, "done",
+                               "全部任务点已完成")
+            log.info("重进核对: 本节 " + str(len(jobs)) + " 个任务点已全部变绿")
             return
         for j in still:
-            prev = self.progress.status(self.platform, course.cid, task.tid, j["i"])
+            prev = self.progress.status(self.platform, course.cid, task.tid, j["key"])
             # 平台可能延迟，给两轮机会；连续两次都不过就锁死，避免无限重播
             status = "platform_reject" if prev == "platform_reject" else "failed"
             self.progress.mark(self.platform, course.cid, task.tid, status,
-                               "重进后仍未完成", job=j["i"])
-        log.warning("重进核对: 还有 " + str(len(still)) + " 个任务点没变绿")
+                               "重进后仍未完成（" + j["kind"] + "）", job=j["key"])
+        log.warning("重进核对: 还有 " + str(len(still)) + " 个任务点没变绿: " +
+                    ", ".join(j["text"] + "/" + j["kind"] for j in still))
 
-    JS_CLEAR_MASK = """
-() => {
-  // 测验弹窗的遮罩/浮层会挡住任务点，点之前先摘掉
-  ['#workpop', '.maskDiv', '.layui-layer-shade', '.layui-layer', '.popDiv'].forEach(function (s) {
-    document.querySelectorAll(s).forEach(function (n) { n.remove(); });
-  });
-  // 顶部导航条也会压住元素，让它不再吃点击
-  document.querySelectorAll('.subNav').forEach(function (n) { n.style.pointerEvents = 'none'; });
-  return true;
-}
-"""
+    # 与 checkup 共用同一段探测脚本，免得两处逻辑漂移
+    JS_JOBS = JS_JOB_STATUS
 
-    async def _clear_mask(self, target) -> None:
+    async def _read_jobs(self, target) -> list[dict]:
+        """只读当前 frame 的任务点状态，不滚动不等待（轮询用）。"""
         try:
-            await target.evaluate(self.JS_CLEAR_MASK)
+            return (await target.evaluate(self.JS_JOBS)) or []
+        except Exception:
+            return []
+
+    async def _do_doc_job(self, adapter, target, job: dict) -> bool:
+        """文档任务点：点开滚到底，平台多数会把图标变成已完成。"""
+        try:
+            await adapter.clear_mask(target)
+            icon = target.locator(".ans-job-icon").nth(job["i"])
+            await icon.scroll_into_view_if_needed(timeout=5000)
+            await icon.click(timeout=6000)
+        except Exception as e:
+            log.warning("点击文档任务点失败: " + str(e))
+        await asyncio.sleep(2.5)
+        try:
+            await target.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
         except Exception:
             pass
-
-    JS_JOBS = """
-() => {
-  // 类型主要看容器里的 iframe 模块名：modules/video 是视频，modules/work 是测验
-  const out = [];
-  document.querySelectorAll('.ans-job-icon').forEach(function (el, i) {
-    const box = el.closest('.ans-attach-ct') || el.parentElement;
-    const cls = (el.className || '').toString();
-    let kind = 'unknown';
-    if (cls.indexOf('ans-job-video') >= 0) kind = 'video';
-    else if (cls.indexOf('ans-job-work') >= 0) kind = 'work';
-    else if (box) {
-      const ifr = box.querySelector('iframe');
-      const src = ifr ? (ifr.getAttribute('src') || '') : '';
-      if (src.indexOf('modules/work') >= 0) kind = 'work';
-      else if (src.indexOf('modules/video') >= 0) kind = 'video';
-      else if (box.querySelector('.ans-attach-online, video')) kind = 'video';
-      else if (box.querySelector('a[href*="work"], [onclick*="work"]')) kind = 'work';
-    }
-    out.push({
-      i: i, kind: kind,
-      done: /ans-job-finished/.test(box ? (box.className || '') : '')
-    });
-  });
-  return out;
-}
-"""
+        await asyncio.sleep(1.5)
+        for j in await self._read_jobs(target):
+            if j["i"] == job["i"] and j.get("done"):
+                return True
+        return False
 
     async def _list_jobs(self, target) -> list[dict]:
-        # 任务点是懒加载的：不滚到底，后面的答题根本不会出现在 DOM 里
-        try:
-            await target.evaluate(
-                "() => { window.scrollTo(0, document.body.scrollHeight); "
-                "setTimeout(function(){ window.scrollTo(0, 0); }, 300); }"
-            )
-            await asyncio.sleep(2.0)
-        except Exception:
-            pass
-        try:
-            jobs = await target.evaluate(self.JS_JOBS)
-        except Exception as e:
-            log.warning("读取任务点失败: " + str(e))
-            return []
-        known = [j for j in jobs if j.get("kind") != "unknown"]
-        if not known:
-            log.warning("本组没读到任务点（原始 %d 个，全部 unknown）frame=%s"
-                        % (len(jobs), (getattr(target, "url", "") or "")[:60]))
+        # 任务点是懒加载的：不滚到底，后面的答题根本不会出现在 DOM 里。
+        # 刚切完分组时 cards 可能还在重绘，读空就再等一轮，别急着判"没有任务点"。
+        known: list[dict] = []
+        for attempt in range(3):
+            try:
+                await target.evaluate(
+                    "() => { window.scrollTo(0, document.body.scrollHeight); "
+                    "setTimeout(function(){ window.scrollTo(0, 0); }, 300); }"
+                )
+                await asyncio.sleep(1.8)
+            except Exception:
+                pass
+            try:
+                jobs = await target.evaluate(self.JS_JOBS)
+            except Exception as e:
+                log.warning("读取任务点失败: " + str(e))
+                return []
+            known = [j for j in jobs if j.get("kind") != "unknown"]
+            if known:
+                return known
+            if attempt < 2:
+                await asyncio.sleep(2.0)
+        log.warning("本组没读到任务点 frame=%s" % ((getattr(target, "url", "") or "")[:70]))
         return known
 
-    async def _click_job(self, target, job: dict):
+    async def _click_job(self, adapter, target, job: dict):
         """点开任务点，返回 (视频 frame, 重新取 frame 的闭包)。
 
         必须返回"这个任务点自己的" iframe，否则同一节有两个视频时会一直播第一个。
         """
         try:
-            await self._clear_mask(target)
+            await adapter.clear_mask(target)
             icon = target.locator(".ans-job-icon").nth(job["i"])
             await icon.scroll_into_view_if_needed(timeout=5000)
             box = icon.locator("xpath=ancestor::div[contains(@class,'ans-attach-ct')][1]")
@@ -519,7 +596,7 @@ class Runner:
         except Exception:
             opened_before = set()
         try:
-            await self._clear_mask(target)
+            await adapter.clear_mask(target)
             icon = target.locator(".ans-job-icon").nth(job["i"])
             await icon.scroll_into_view_if_needed(timeout=5000)
             await icon.click(timeout=6000)

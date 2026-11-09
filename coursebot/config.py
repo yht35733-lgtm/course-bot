@@ -42,7 +42,7 @@ DEFAULTS: dict[str, Any] = {
         "submit": True,           # False = 只打印答案不提交，用于人工核对
         "retry_wrong": 1,
         "delay_between": 1.2,
-        "submit_delay": 60,       # 提交前等待秒数；太短会触发 /work/validate 的账号异常判定
+        "submit_delay": 20,       # 提交前等待秒数；太短会触发 /work/validate 的账号异常判定
     },
     "llm": {
         "enabled": False,

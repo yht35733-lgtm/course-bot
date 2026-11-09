@@ -85,6 +85,14 @@ class QuizEngine:
         if q.qtype == "fill" or q.qtype == "short":
             return [str(a) for a in answer]
 
+        # 判断题题库里常见 true/false、对/错，直接按语义映射，别丢成空答案
+        if q.qtype == "judge" and answer and len(q.options) >= 2:
+            v = str(answer[0]).strip().lower()
+            if v in ("true", "t", "对", "正确", "是", "√", "a"):
+                return [0]
+            if v in ("false", "f", "错", "错误", "否", "×", "b"):
+                return [1]
+
         current = [self._norm_opt(o) for o in q.options]
         out: list[Any] = []
         for a in answer:
@@ -134,17 +142,22 @@ class QuizEngine:
         hit, score = self.bank.search(q.stem, q.qtype, self.threshold)
         q.similarity = score
         if hit:
-            q.answer = self._map_answer(hit["answer"], hit.get("options") or [], q)
-            q.source = "bank"
-            self.bank.bump(q.stem, q.qtype, True)
-        else:
-            q.answer = []
-            q.source = "none"
+            mapped = self._map_answer(hit["answer"], hit.get("options") or [], q)
+            if mapped:
+                q.answer = mapped
+                q.source = "bank"
+                self.bank.bump(q.stem, q.qtype, True)
+                return q
+            # 命中了但映射不出下标（脏数据），当作没命中，交给模型
+            log.debug("题库答案映射失败，转模型: " + q.stem[:30])
+        q.answer = []
+        q.source = "none"
         return q
 
     # ---------- 整页流程 ----------
 
-    async def run_page(self, adapter, page, frames=None) -> QuizOutcome:
+    async def run_page(self, adapter, page, frames=None, popup: bool = False) -> QuizOutcome:
+        """popup=True 表示视频弹题：走弹题自己的提交按钮，且不等待风控延时。"""
         out = QuizOutcome()
         questions: list[Question] = []
         target = page
@@ -225,22 +238,29 @@ class QuizEngine:
             self._dump_pending(out.pending)
 
         if self.cfg.get("submit", True):
-            # 提交前会先打 /work/validate，返回 status=1 就判「账号异常」直接拦下。
-            # 答题太快最容易触发，等久一点并带随机抖动。
-            wait = float(self.cfg.get("submit_delay", 60))
-            if wait > 0:
-                wait += random.uniform(0, wait * 0.3)
-                log.info("提交前等待 " + str(int(wait)) + " 秒，避开风控校验")
-                await asyncio.sleep(wait)
-            ok = await adapter.submit_quiz(target)
-            out.submitted = ok
-            if ok:
-                await adapter.read_quiz_result(target, questions)
-                for q in questions:
-                    if q.source == "llm" and q.answer:
-                        self.bank.add(q.stem, [str(x) for x in q.answer], q.qtype,
-                                      q.options, platform=adapter.name, source="llm")
-            out.detail = "已提交" if ok else "提交按钮未找到"
+            if popup:
+                # 弹题是播放器自己弹的，没有 /work/validate 那套风控，
+                # 也不能等几十秒——视频会被一路暂停，整节卡死。
+                ok = await adapter.submit_popup_quiz(target)
+                out.submitted = ok
+                out.detail = "弹题已提交" if ok else "弹题提交入口没找到"
+            else:
+                # 提交前会先打 /work/validate，返回 status=1 就判「账号异常」直接拦下。
+                # 答题太快最容易触发，等久一点并带随机抖动。
+                wait = float(self.cfg.get("submit_delay", 20))
+                if wait > 0:
+                    wait += random.uniform(0, wait * 0.3)
+                    log.info("提交前等待 " + str(int(wait)) + " 秒，避开风控校验")
+                    await asyncio.sleep(wait)
+                ok = await adapter.submit_quiz(target)
+                out.submitted = ok
+                if ok:
+                    await adapter.read_quiz_result(target, questions)
+                    for q in questions:
+                        if q.source == "llm" and q.answer:
+                            self.bank.add(q.stem, [str(x) for x in q.answer], q.qtype,
+                                          q.options, platform=adapter.name, source="llm")
+                out.detail = "已提交" if ok else "提交没成功（按钮/风控）"
         else:
             out.detail = "仅计算，未提交"
 

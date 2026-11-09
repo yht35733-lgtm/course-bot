@@ -103,9 +103,28 @@ class BrowserSession:
 
         self._context = await self._launch(kwargs)
         self._context.set_default_timeout(self.cfg.get("navigation_timeout", 45000))
+        # 超星动不动就 alert("请刷新页面后重试") / beforeunload 确认框。
+        # 原生对话框一弹，渲染进程被冻住，之后所有 locator 操作都卡在
+        # "performing click action" 直到超时。这里统一自动确认掉。
+        self._context.on("dialog", self._on_dialog)
         await self._context.add_init_script(STEALTH_JS)
         await self.restore_state()
         return self
+
+    @staticmethod
+    async def _on_dialog(dialog) -> None:
+        try:
+            from .logger import log as _log
+            _log.info("自动处理对话框: " + (dialog.message or "")[:60])
+        except Exception:
+            pass
+        try:
+            await dialog.accept()
+        except Exception:
+            try:
+                await dialog.dismiss()
+            except Exception:
+                pass
 
     LOCK_NAMES = ("SingletonLock", "SingletonCookie", "SingletonSocket",
                   "lockfile", "DevToolsActivePort")

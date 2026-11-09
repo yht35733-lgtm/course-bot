@@ -157,39 +157,10 @@ async def cmd_login(cfg, args) -> None:
             print("登录未完成，请重新运行 login")
 
 
-JS_PENDING = """
-() => Array.from(document.querySelectorAll('.chapter_item')).map(function (it) {
-  const t = it.querySelector('.catalog_title');
-  if (!t) return null;
-  const n = it.querySelector('.catalog_points_yi');
-  const nameEl = it.querySelector('.catalog_name');
-  return {
-    title: (t.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 34),
-    pending: n ? parseInt((n.innerText || '0').trim(), 10) : 0,
-    done: /ans-job-finished/.test(it.className || '')
-  };
-}).filter(Boolean)
-"""
-
-
-JS_JOB_STATUS = """
-() => Array.from(document.querySelectorAll('.ans-job-icon')).map(function (el, i) {
-  const box = el.closest('.ans-attach-ct') || el.parentElement;
-  const cls = (el.className || '').toString();
-  const ifr = box ? box.querySelector('iframe') : null;
-  const src = ifr ? (ifr.getAttribute('src') || '') : '';
-  let kind = 'video';
-  if (cls.indexOf('ans-job-work') >= 0 || src.indexOf('modules/work') >= 0) kind = 'work';
-  else if (cls.indexOf('ans-job-doc') >= 0) kind = 'doc';
-  return { i: i, kind: kind,
-           done: /ans-job-finished/.test(box ? (box.className || '') : '') };
-})
-"""
-
-
-async def cmd_check(cfg, args) -> int:
-    """逐节进页面读任务点级状态，和本地 progress 对比。返回未完成小节数。"""
+async def cmd_check(cfg, args, deep: bool = True) -> int:
+    """核对平台任务点。deep=True 逐节打开读明细，deep=False 只按目录计数校准。"""
     from coursebot.browser import BrowserSession
+    from coursebot.checkup import check_course
     from coursebot.platforms import get_adapter
     from coursebot.store import Progress
 
@@ -207,55 +178,28 @@ async def cmd_check(cfg, args) -> int:
             courses = [c for c in courses if any(k in c.name for k in args.course)]
 
         for c in courses:
-            await adapter.open_course(c)
-            tasks = await adapter.list_tasks(c)
-            picks = getattr(args, "task", None) or []
-            if picks:
-                tasks = [t for t in tasks if any(k in t.title for k in picks)]
+            picks = getattr(args, "task", None) or None
+            details = await check_course(adapter, c, prog, cfg["platform"],
+                                        fix=getattr(args, "fix", False), picks=picks,
+                                        deep=deep)
             print("")
-            print("课程: " + c.name + " (" + str(len(tasks)) + " 节)")
-            bad = 0
-            for t in tasks:
-                try:
-                    # open_task 依赖章节列表 iframe，每节前要回到课程页重新取
-                    await adapter.open_course(c)
-                    target = await adapter.open_task(t)
-                    if target is None:
-                        print("   [打不开] " + t.title[:26])
-                        continue
-                    await asyncio.sleep(1.0)
-                    jobs = await target.evaluate(JS_JOB_STATUS)
-                except Exception as e:
-                    print("   [读取失败] " + t.title[:26] + " :: " + str(e)[:40])
-                    continue
-                if not jobs:
-                    print("   [无任务点] " + t.title[:26])
-                    continue
-                pending = [j for j in jobs if not j["done"]]
-                if args.fix:
-                    for j in jobs:
-                        prog.mark(cfg["platform"], c.cid, t.tid,
-                                  "done" if j["done"] else "failed",
-                                  "平台核对", job=j["i"])
-                    if not pending:
-                        prog.mark(cfg["platform"], c.cid, t.tid, "done", "平台核对")
-                if pending:
-                    bad += 1
-                    kinds = "/".join(j["kind"] for j in pending)
-                    local = prog.status(cfg["platform"], c.cid, t.tid) or "无"
-                    print("   [还差 %d] %-26s %-10s 本地=%s" %
-                          (len(pending), t.title[:24], kinds, local))
-            if not bad:
+            print("课程: " + c.name)
+            if not details:
                 print("   全部完成")
-            bad_total += bad
+                continue
+            for d in details:
+                print("   [还差 %d] %-26s %-10s 本地=%s" %
+                      (d["pending"], d["title"][:24], d["kind"], d["local"]))
+                bad_total += 1
     print("")
     print("合计还有 " + str(bad_total) + " 个小节没做完")
     return bad_total
 
 
 async def cmd_audit(cfg, args) -> None:
-    """读章节列表上的「待完成任务点」计数，列出还没做完的小节。"""
+    """只看目录计数，快速列出还没做完的小节。"""
     from coursebot.browser import BrowserSession
+    from coursebot.checkup import audit_course
     from coursebot.platforms import get_adapter
 
     async with BrowserSession(cfg["browser"], headless=False) as sess:
@@ -269,26 +213,19 @@ async def cmd_audit(cfg, args) -> None:
         if args.course:
             courses = [c for c in courses if any(k in c.name for k in args.course)]
 
-        total_pending = 0
+        total = 0
         for c in courses:
-            await adapter.open_course(c)
-            frame = await adapter.catalog_frame()
-            if frame is None:
-                print("[跳过]", c.name, "- 拿不到章节列表")
-                continue
-            await frame.wait_for_timeout(1500)
-            rows = await frame.evaluate(JS_PENDING)
-            left = [r for r in rows if r["pending"] > 0]
-            finished = len(rows) - len(left)
+            rows, left = await audit_course(adapter, c)
             print("")
-            print("课程: " + c.name + "  (" + str(finished) + "/" + str(len(rows)) + " 已完成)")
+            print("课程: " + c.name + "  (" + str(len(rows) - len(left)) + "/" +
+                  str(len(rows)) + " 已完成)")
             for r in left:
-                total_pending += r["pending"]
+                total += r["pending"]
                 print("   [还差 %d] %s" % (r["pending"], r["title"]))
             if not left:
                 print("   全部完成")
         print("")
-        print("合计还差 " + str(total_pending) + " 个任务点")
+        print("合计还差 " + str(total) + " 个任务点")
 
 
 async def cmd_course(cfg, args) -> None:
@@ -356,12 +293,13 @@ async def cmd_run(cfg, args) -> None:
                     print("   ", t.kind, "|", t.title)
         return
 
-    # 默认先对账一次：本地记录被改过很多轮，跑之前用平台真实状态校准
+    # 默认先按目录对账：本地 progress 被旧逻辑污染过，只差测验的小节被标成 done，
+    # 不校准就一路"跳过已完成"。逐节明细用 check 子命令单独跑（deep=True）。
     if not getattr(args, "no_check", False):
-        log.info("先核对平台任务点状态（--no-check 可跳过）")
+        log.info("先按目录核对平台任务点（--no-check 可跳过）")
         try:
             args.fix = True          # 核对结果直接写回进度
-            await cmd_check(cfg, args)
+            await cmd_check(cfg, args, deep=False)
         except Exception as e:
             log.warning("核对失败，按本地进度继续: " + str(e))
 

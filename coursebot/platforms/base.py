@@ -116,8 +116,38 @@ class PlatformAdapter(ABC):
     async def submit_quiz(self, page) -> bool:
         ...
 
+    async def submit_popup_quiz(self, page) -> bool:
+        """视频弹题的提交入口。没有独立按钮的平台直接复用普通提交。"""
+        return await self.submit_quiz(page)
+
     async def read_quiz_result(self, page, questions: list[Question]) -> None:
         return None
+
+    JS_CLEAR_MASK = """
+() => {
+  // 弹窗遮罩会挡住任务点、也会锁住页面滚动，点之前先摘掉
+  ['#workpop', '.maskDiv', '.layui-layer-shade', '.layui-layer', '.popDiv'].forEach(function (s) {
+    document.querySelectorAll(s).forEach(function (n) { n.remove(); });
+  });
+  document.querySelectorAll('.subNav').forEach(function (n) { n.style.pointerEvents = 'none'; });
+  // 遮罩移除后 body 的 overflow 常常还是 hidden，手动解锁
+  document.body.style.overflow = '';
+  document.documentElement.style.overflow = '';
+  return true;
+}
+"""
+
+    async def clear_mask(self, page) -> None:
+        """遮罩常留在顶层文档（章节详情顶栏、#workpop），只清 iframe 内部没用。"""
+        targets = [page]
+        owner = getattr(page, "page", None)
+        if owner is not None and owner is not page:
+            targets.append(owner)
+        for t in targets:
+            try:
+                await t.evaluate(self.JS_CLEAR_MASK)
+            except Exception:
+                continue
 
     async def dismiss_quiz(self, page) -> bool:
         """弹题答不上时把它关掉，否则视频会永远停在这里，整个章节做不完。
@@ -188,19 +218,17 @@ class PlatformAdapter(ABC):
 
     @staticmethod
     async def safe_click(locator) -> bool:
+        # 遮罩存在时 Playwright 会一直重试到超时，等 1.5 秒就够判断了
         try:
-            await locator.click(timeout=4000)
+            await locator.click(timeout=1500)
             return True
         except Exception:
-            # 无头模式下元素常被判"不可操作"，用 JS 直接触发一次
+            pass
+        # 被遮罩拦住 / 判"不可操作"时，用 JS 直接触发（JS 点击不受浮层影响）
+        for attempt in ("el => el.click()", "el => el.dispatchEvent(new MouseEvent('click', {bubbles: true}))"):
             try:
-                await locator.evaluate("(el) => el.click()")
+                await locator.evaluate(attempt)
                 return True
             except Exception:
-                pass
-        except Exception:
-            try:
-                await locator.click(force=True, timeout=3000)
-                return True
-            except Exception:
-                return False
+                continue
+        return False

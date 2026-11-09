@@ -5,6 +5,7 @@ requests>=2.31
 loguru>=0.7
 rich>=13.0
 lxml>=5.0
+fonttools>=4.40      # 字体反爬：读字形轮廓算 hash
 
 # 可选：AI 兜底答题 / Web 控制台
 openai>=1.30
