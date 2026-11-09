@@ -85,12 +85,14 @@ class QuizEngine:
         if q.qtype == "fill" or q.qtype == "short":
             return [str(a) for a in answer]
 
-        # 判断题题库里常见 true/false、对/错，直接按语义映射，别丢成空答案
-        if q.qtype == "judge" and answer and len(q.options) >= 2:
+        # 判断题题库里常见 true/false/对/错/0/1，直接按语义映射。
+        # 不能要求 len(q.options) >= 2 —— 弹题经常一个选项都抽不到，
+        # 那样这里会被跳过，最后返回空答案，题目永远答不出来。
+        if q.qtype == "judge" and answer:
             v = str(answer[0]).strip().lower()
-            if v in ("true", "t", "对", "正确", "是", "√", "a"):
+            if v in ("true", "t", "对", "正确", "是", "√", "a", "0"):
                 return [0]
-            if v in ("false", "f", "错", "错误", "否", "×", "b"):
+            if v in ("false", "f", "错", "错误", "否", "×", "b", "1"):
                 return [1]
 
         current = [self._norm_opt(o) for o in q.options]
@@ -216,7 +218,8 @@ class QuizEngine:
         for q in questions:
             tag = q.source
             log.info(
-                "第" + str(q.index + 1) + "题 [" + q.qtype + "/" + tag + "] " +
+                "第" + str(q.index + 1) + "题 [" + q.qtype + "/" + tag +
+                " opt=" + str(len(q.options)) + "] " +
                 q.stem[:40].replace("\n", " ") + " -> " + str(q.answer)
             )
             if q.answer:

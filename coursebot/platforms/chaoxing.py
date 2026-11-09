@@ -43,6 +43,9 @@ class ChaoxingAdapter(PlatformAdapter):
     QUESTION_ITEM = ".questionLi, .TiMu, .question-item"
     QUESTION_STEM = ".Zy_TItle, .mark_name, .question-title"
     QUESTION_OPTION = "li, .answer_p, .option"
+    # 播放器弹题的选项不是 li，是 .ans-videoquiz-opt 里的一层；主选择器抽不到时用它兜底
+    POPUP_OPTION = (".ans-videoquiz-opt li, .ans-videoquiz li, .videoquiz li,"
+                    " .ans-videoquiz-opt, .videoquiz-opt")
     # 超星作业页两个按钮：.btnSave=暂时保存（noSubmit()），.btnSubmit=提交（btnBlueSubmit()）。
     # 之前的选择器没含 .btnSubmit，反而点到了保存，作业只存草稿，任务点永远不变绿。
     SUBMIT_BTN = (".btnSubmit, .completeBtn, a:has-text('提交'),"
@@ -354,16 +357,22 @@ class ChaoxingAdapter(PlatformAdapter):
 
             opts: list[str] = []
             nodes: list[Any] = []
-            try:
-                opt_loc = root.locator(self.QUESTION_OPTION)
-                for j in range(await opt_loc.count()):
+            # 先按作业页结构抽；抽不到再按弹题结构抽一遍，
+            # 否则判断题连选项都没有，映射不出下标，题目永远答不出来。
+            for sel in (self.QUESTION_OPTION, self.POPUP_OPTION):
+                try:
+                    opt_loc = root.locator(sel)
+                    cnt = await opt_loc.count()
+                except Exception:
+                    continue
+                for j in range(cnt):
                     o = opt_loc.nth(j)
                     t = await self.text_of(o)
                     if t and len(t) < 200:
                         opts.append(self.decode(t))
                         nodes.append(o)
-            except Exception:
-                pass
+                if opts:
+                    break
 
             qtype = await self._detect_type(stem, opts, root)
             questions.append(Question(index=i, stem=stem, qtype=qtype,
