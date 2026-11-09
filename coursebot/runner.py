@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import random
 from datetime import datetime
 from typing import Optional
@@ -13,6 +14,7 @@ from .config import ROOT
 from .logger import log
 from .models import Course, Task, TaskResult
 from .platforms import get_adapter
+from .popup import PopupHandler
 from .quiz import QuizEngine
 from .state import RunState
 from .store import Progress
@@ -34,6 +36,18 @@ class Runner:
         self.state = state or RunState()
         self.stats = self.state.stats
         self._pend_hint = None      # 目录里这一节还差几个任务点（None=未知）
+        self._popup = None          # 每个视频一个弹题处理者，play_target 里创建
+
+    async def _wait_if_paused(self) -> None:
+        """暂停时卡在这里，停止时立刻放行交给上层判断。
+
+        只挡播放循环是不够的：编排层会在暂停期间继续开下一节、点任务点。
+        """
+        ctl = self.state.control
+        if ctl.stopped or ctl.active():
+            return
+        log.info("已暂停，等待继续\u2026")
+        await ctl.wait()
 
     @staticmethod
     def _tid_index(task: Task) -> int:
@@ -179,6 +193,7 @@ class Runner:
         for i, task in enumerate(tasks, 1):
             if self.stopped:
                 break
+            await self._wait_if_paused()
             st.task_index = i
             pend = pmap.get(self._tid_index(task))
             local_done = (not self.cfg["runner"].get("ignore_done")
@@ -255,29 +270,14 @@ class Runner:
     async def play_target(self, adapter, task: Task, target, refetch=None) -> TaskResult:
         popup = adapter.VIDEO_QUESTION_POPUP
         hold = {"frame": target}
+        self._popup = PopupHandler(adapter, self.quiz)
         st = self.state
 
         async def on_quiz() -> bool:
             st.phase = "quiz"
-            frame = hold["frame"]
-            try:
-                owner = getattr(frame, "page", None) or frame
-                all_frames = list(owner.frames)
-            except Exception:
-                all_frames = []
-            # popup=True：弹题有自己的提交按钮，也不需要等风控延时
-            outcome = await self.quiz.run_page(adapter, frame, frames=all_frames, popup=True)
+            ok = await self._popup.handle(hold["frame"])
             st.phase = "video"
-            if outcome.submitted or (outcome.total and outcome.answered >= outcome.total):
-                return True
-            # 答不上就关掉弹题，否则视频永远停在这儿，整个章节都别想完成
-            log.warning("弹题未能作答（" + outcome.detail + "），关闭弹题继续播放")
-            try:
-                closed = await adapter.dismiss_quiz(frame)
-                log.info("弹题已关闭" if closed else "弹题关闭失败，下一轮再试")
-            except Exception as e:
-                log.warning("关闭弹题异常: " + str(e))
-            return False
+            return ok
 
         if self.cfg["video"].get("skip_quiz"):
             on_quiz = None
@@ -407,6 +407,7 @@ class Runner:
         for _ in range(12):
             if self.stopped:
                 return ok_any, details
+            await self._wait_if_paused()
             live = {j["i"] for j in await self._read_jobs(target) if j.get("done")}
             pending = [j for j in jobs if j["i"] not in live
                        and tried.get(tab_key + ":" + str(j["i"]), 0) < 2]

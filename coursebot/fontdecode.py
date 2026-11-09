@@ -73,6 +73,8 @@ def _glyph_hash(glyph) -> str:
 
 
 _cache: dict[str, Any] = {}
+# 字体内容签名 -> 解码映射：弹题高频触发时避免重复解析 TTF
+_decode_cache: dict[str, dict[str, str]] = {}
 
 
 def _render_vec(font_path: str, ch: str, index: int = 0):
@@ -172,8 +174,10 @@ JS_GET_FONT = """
     try { rules = s.cssRules; } catch (e) { continue; }
     if (!rules) continue;
     for (const r of Array.from(rules)) {
-      const src = r.style && r.style.src;
-      if (src && src.indexOf('base64') >= 0 && /ttf|woff/i.test(src)) out.push(src);
+      const st = r.style || {};
+      const src = st.src || '';
+      if (src.indexOf('base64') < 0 || !/ttf|woff/i.test(src)) continue;
+      out.push({ family: (st.fontFamily || '').replace(/['"]/g, '').trim(), src: src });
     }
   }
   return out;
@@ -203,20 +207,25 @@ class FontDecoder:
             from fontTools.ttLib import TTFont
             font = TTFont(str(ttf), lazy=False)
             glyf = font["glyf"]
-            order = font.getGlyphOrder()
+            cmap = font.getBestCmap() or {}
         except Exception as e:
             log.debug("读字形轮廓失败: " + str(e))
             return {}
         out: dict[str, str] = {}
-        for name in order:
-            if not name.startswith("uni"):
+        # 用 cmap 反查，不依赖 glyph 名字是不是 uniXXXX：
+        # 播放器弹题的字体 glyph 名常常是 glyph00001，按名字筛会一个都命中不了。
+        for code, gname in cmap.items():
+            try:
+                h = _glyph_hash(glyf[gname])
+            except Exception:
+                continue
+            if not h:
+                continue
+            src = table.get(h)
+            if not src:
                 continue
             try:
-                h = _glyph_hash(glyf[name])
-                src = table.get(h) if h else None
-                if not src:
-                    continue
-                out[chr(int(name[3:], 16))] = chr(int(src[3:], 16))
+                out[chr(code)] = chr(int(src[3:], 16))
             except Exception:
                 continue
         return out
@@ -264,38 +273,76 @@ class FontDecoder:
         if not frames:
             frames = [page]
 
+        # 一个页面里往往有好几套内联字体：播放器图标(play/pause/fullscreen)、
+        # 反爬字体、图标库。逐个试，谁的字形哈希命中最多就用谁 ——
+        # 之前直接取最后一个，抓到的正是播放器图标字体，整页解码全废。
+        cands: list[tuple[Any, dict]] = []
         for f in frames:
             try:
                 got = await f.evaluate(JS_GET_FONT) or []
             except Exception:
                 continue
-            if got:
-                srcs = got
-                log.info("在 frame 里找到内联字体: " + (f.url or "")[:60])
-                break
-        if not srcs:
+            for item in got:
+                if isinstance(item, str):
+                    item = {"family": "", "src": item}
+                cands.append((f, item))
+        if not cands:
             log.info("字体解码：没找到内联字体")
             return 0
+        log.info("内联字体候选 " + str(len(cands)) + " 个: " +
+                 " / ".join((it.get("family") or "?") for _, it in cands[:6]))
 
-        m = re.search(r"base64,([A-Za-z0-9+/=]+)", srcs[-1])
-        if not m:
-            return 0
-        try:
-            data = base64.b64decode(m.group(1))
-        except Exception:
-            return 0
-
-        tmp = Path(__file__).resolve().parent.parent / "data" / "fonts"
-        tmp.mkdir(parents=True, exist_ok=True)
-        ttf = tmp / "current.ttf"
-        ttf.write_bytes(data)
+        # 弹题几秒就触发一次，每次都重新解析 TTF 很费时，页面跟着卡；
+        # 同一批字体只解析一次，结果按字体内容签名缓存。
+        sig = hashlib.md5("|".join((it.get("src") or "")[:120]
+                                   for _, it in cands).encode()).hexdigest()
+        cached = _decode_cache.get(sig)
+        if cached is not None:
+            self.map = dict(cached)
+            self.ready = bool(self.map)
+            log.debug("字体解码命中缓存: " + str(len(self.map)) + " 个字")
+            return len(self.map)
 
         try:
             from fontTools.ttLib import TTFont
         except Exception:
             return 0
+
+        tmp = Path(__file__).resolve().parent.parent / "data" / "fonts"
+        tmp.mkdir(parents=True, exist_ok=True)
+
+        best = None   # (命中数, 路径, hash映射, 字形数, family)
+        for k, (f, item) in enumerate(cands):
+            m = re.search(r"base64,([A-Za-z0-9+/=]+)", item.get("src") or "")
+            if not m:
+                continue
+            try:
+                probe = tmp / ("cand%d.ttf" % k)
+                probe.write_bytes(base64.b64decode(m.group(1)))
+                cmap_len = len(TTFont(str(probe)).getBestCmap() or {})
+            except Exception:
+                continue
+            if not cmap_len:
+                continue
+            by_hash = self._match_by_hash(probe)
+            if best is None or len(by_hash) > best[0]:
+                best = (len(by_hash), probe, by_hash, cmap_len,
+                        item.get("family") or "")
+
+        if best is None:
+            log.info("字体解码：候选字体全部解析失败")
+            return 0
+
+        score, probe, by_hash, cmap_len, family = best
+        ttf = tmp / "current.ttf"
         try:
-            cmap = TTFont(str(ttf)).getBestCmap()
+            ttf.write_bytes(probe.read_bytes())
+        except Exception:
+            ttf = probe
+        log.info("选用字体「" + (family or "?") + "」哈希命中 " +
+                 str(score) + "/" + str(cmap_len))
+        try:
+            cmap = TTFont(str(ttf)).getBestCmap() or {}
         except Exception as e:
             log.debug("字体解析失败: " + str(e))
             return 0
@@ -309,10 +356,18 @@ class FontDecoder:
             log.info("字体哈希精确匹配 " + str(len(by_hash)) + "/" + str(len(cmap)) + " 个字")
             log.info("  样例: " + "".join("%s->%s " % (k, v)
                                           for k, v in list(self.map.items())[:6]))
+            _decode_cache[sig] = dict(self.map)
             return len(self.map)
 
-        if by_hash:
-            log.info("哈希只命中 " + str(len(by_hash)) + "/" + str(len(cmap)) + "，其余走字形比对")
+        if not by_hash:
+            # 一个字形都没匹配上，说明抓来的不是反爬字体（多半是播放器图标字体）。
+            # 这时像素比对要现算 6000+ 字形（首轮 20 多秒），产出还全是错字，
+            # 不如保留原文：乱码至少不会把题干换成看似正常的错字。
+            log.warning("候选字体没有一个能匹配反爬字形，跳过解码（保留原文）")
+            self.map = {}
+            self.ready = False
+            return 0
+        log.info("哈希只命中 " + str(len(by_hash)) + "/" + str(len(cmap)) + "，其余走字形比对")
         self.map = dict(by_hash)
         self.map.update(self._match(ttf, cmap))
         self.ready = bool(self.map)
@@ -325,4 +380,6 @@ class FontDecoder:
             log.info("字体反爬解码 " + str(len(self.map)) + " 个字" +
                      ("（低置信 " + str(len(weak)) + " 个）" if weak else "") + ": " +
                      "".join("%s->%s " % (k, v) for k, v in list(self.map.items())[:6]))
+        if self.map:
+            _decode_cache[sig] = dict(self.map)
         return len(self.map)

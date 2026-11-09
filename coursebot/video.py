@@ -188,6 +188,14 @@ class VideoEngine:
         if force:
             await self._install_guard(rate)
 
+        # 暂停时别点播放：这段在 while 之前，原来不检查闸门，
+        # 结果点了暂停它照样起播一下再停下，看着像"暂停没反应"。
+        if self.gate is not None and not self.gate.active():
+            log.info("已暂停，起播前先等待继续\u2026")
+            await self.gate.wait()
+            if self.gate.stopped:
+                return TaskResult(task, False, "已手动停止")
+
         # 先点播放器的播放按钮，让它的初始化 + 上报流程正常跑起来
         if self.cfg.get("click_play", True):
             try:

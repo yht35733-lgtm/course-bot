@@ -125,14 +125,16 @@ class PlatformAdapter(ABC):
 
     JS_CLEAR_MASK = """
 () => {
-  // 弹窗遮罩会挡住任务点、也会锁住页面滚动，点之前先摘掉
-  ['#workpop', '.maskDiv', '.layui-layer-shade', '.layui-layer', '.popDiv'].forEach(function (s) {
-    document.querySelectorAll(s).forEach(function (n) { n.remove(); });
+  // 只把可见的遮罩藏起来，不删任何元素。
+  // #workpop 是 workPop() 弹确认框用的容器，.popDiv 里装着提交按钮，
+  // 删掉之后手动点提交会毫无反应（点了 btnBlueSubmit 却弹不出确认框）。
+  document.querySelectorAll(".maskDiv, .layui-layer-shade").forEach(function (n) {
+    try {
+      if (getComputedStyle(n).display !== "none") n.style.display = "none";
+    } catch (e) {}
   });
-  document.querySelectorAll('.subNav').forEach(function (n) { n.style.pointerEvents = 'none'; });
-  // 遮罩移除后 body 的 overflow 常常还是 hidden，手动解锁
-  document.body.style.overflow = '';
-  document.documentElement.style.overflow = '';
+  document.body.style.overflow = "";
+  document.documentElement.style.overflow = "";
   return true;
 }
 """

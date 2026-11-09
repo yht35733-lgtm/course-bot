@@ -488,6 +488,19 @@ class ChaoxingAdapter(PlatformAdapter):
 }
 """
 
+    # 提交后判断弹层是不是真的收了：真收了 / 出现结果文案 才算交上
+    JS_POPUP_STATE = """
+() => {
+  const q = document.querySelector('.ans-videoquiz, .videoquiz, #videoquiz');
+  if (!q) return 'gone';
+  const st = getComputedStyle(q);
+  if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return 'hidden';
+  const txt = document.body.innerText || '';
+  if (/提交成功|已提交|回答正确|回答错误|已完成/.test(txt)) return 'done';
+  return 'still';
+}
+"""
+
     async def submit_popup_quiz(self, page) -> bool:
         await self.clear_mask(page)
         fired = ""
@@ -509,9 +522,21 @@ class ChaoxingAdapter(PlatformAdapter):
                     continue
         if not fired:
             return False
-        log.info("弹题已提交: " + str(fired))
-        await page.wait_for_timeout(1500)
-        return True
+        log.info("弹题提交事件已触发: " + str(fired))
+        # 点了不等于交上了。弹层收不掉的话播放器会认为没答完，
+        # 30 秒后再弹一次，视频就一直原地打转。
+        state = "still"
+        for _ in range(4):
+            await page.wait_for_timeout(800)
+            try:
+                state = await page.evaluate(self.JS_POPUP_STATE)
+            except Exception:
+                state = "unknown"
+            if state in ("gone", "hidden", "done"):
+                log.info("弹题已承认提交: " + str(state))
+                return True
+        log.warning("点了提交但弹题还在（" + str(state) + "），判定未通过")
+        return False
 
     async def submit_quiz(self, page) -> bool:
         """先提交；提交不成功就退而点「暂时保存」，至少别丢答案。"""
@@ -539,6 +564,16 @@ class ChaoxingAdapter(PlatformAdapter):
 
     async def _try_submit(self, page) -> bool:
         await self.clear_mask(page)
+        # 人可能已经手动交过了，别再补一刀：重复提交会让服务端判无效参数
+        try:
+            if "selectWorkQuestion" in (getattr(page, "url", "") or ""):
+                log.info("已经在成绩页，视为已提交")
+                return True
+            if not await page.locator(".btnSubmit").first.count():
+                log.info("页面上已经没有提交按钮，视为已提交")
+                return True
+        except Exception:
+            pass
         fired = ""
         try:
             fired = await page.evaluate(self.JS_SUBMIT)
